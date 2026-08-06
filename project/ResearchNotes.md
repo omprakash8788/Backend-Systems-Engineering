@@ -626,6 +626,535 @@ Answer these five questions in your own words:
 
 ### Setting Up a Production-Grade Development Environment
 
+Today's Goal
+
+By the end of this lecture, you'll have this running on your laptop:
+
+```
+               Docker
+                  │
+    ┌─────────────┴─────────────┐
+    │                           │
+ PostgreSQL                 Redis
+    │                           │
+    └─────────────┬─────────────┘
+                  │
+             Node.js API
+                  │
+              TypeScript
+                  │
+              Express App
+
+```
+
+No BullMQ today.
+
+No Workers today.
+
+Today is about building a strong foundation.
+
+---
+
+### Step 1 — Create the Project
+
+Open your terminal.
+
+```
+mkdir background-job-system
+```
+
+```
+cd background-job-system
+```
+
+Initialize Node.
+```
+npm init -y
+```
+
+### Think Like an Engineer
+
+Why are we starting from scratch?
+
+Because in a real company, nobody gives you a ready-made project.
+
+You create the architecture yourself.
+
+---
+
+### Step 2 — Install Runtime Dependencies
+
+These are needed when the application runs.
+
+```
+npm install express dotenv
+
+```
+
+Why?
+
+### Express
+
+Creates HTTP APIs.
+
+### dotenv
+
+Loads environment variables from .env.
+
+Never hardcode passwords.
+
+Never hardcode ports.
+
+Never hardcode database URLs.
+
+---
+
+### Step 3 — Install Development Dependencies
+```
+npm install -D \
+typescript \
+tsx \
+@types/node \
+@types/express \
+nodemon
+
+```
+
+Let's understand every package.
+
+---
+TypeScript
+
+Not just for type safety.
+
+It gives us:
+
+- Better IntelliSense
+- Easier refactoring
+- Compile-time errors
+- Safer large codebases
+
+Most production Node.js teams use TypeScript.
+
+---
+
+### tsx
+
+Runs TypeScript directly.
+
+Instead of:
+```
+Compile
+
+↓
+
+Run JS
+```
+
+We'll simply run:
+```
+npm run dev
+```
+Much faster development.
+
+---
+
+### nodemon
+
+Automatically restarts the server.
+
+Without it:
+
+```
+Edit file
+
+↓
+
+Stop server
+
+↓
+
+Restart server
+```
+
+With nodemon:
+```
+Save
+
+↓
+
+Restart automatically
+```
+
+---
+
+### Step 4 — Initialize TypeScript
+
+```
+npx tsc --init
+```
+This creates:
+```
+tsconfig.json
+```
+
+---
+### Replace it with this
+
+```
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "strict": true,
+
+    "esModuleInterop": true,
+
+    "skipLibCheck": true,
+
+    "forceConsistentCasingInFileNames": true,
+
+    "outDir": "./dist",
+
+    "rootDir": "./src"
+  },
+
+  "include": ["src"]
+}
+
+```
+
+---
+
+### Why Strict Mode?
+
+Many beginners disable it.
+
+Professionals don't.
+
+Strict mode catches bugs before production.
+
+Imagine this.
+
+```
+user.name.toUpperCase()
+```
+But
+```
+user = null
+```
+
+Strict mode warns you immediately.
+
+Without it
+
+Production crashes.
+
+---
+
+### Step 6 — Create Folder Structure
+
+Create this exactly.
+```
+background-job-system/
+
+src/
+
+    config/
+
+    controllers/
+
+    routes/
+
+    middleware/
+
+    services/
+
+    queues/
+
+    workers/
+
+    logger/
+
+    utils/
+
+    types/
+
+    app.ts
+
+    server.ts
+
+.env
+
+.gitignore
+
+tsconfig.json
+
+package.json
+
+```
+Notice something.
+
+There is no models folder yet.
+
+Because we haven't introduced Prisma.
+
+Never create folders "just in case."
+
+---
+
+### Step 6 — Create .gitignore
+
+```
+node_modules
+
+dist
+
+.env
+
+coverage
+
+logs
+
+```
+
+Never commit .env.
+
+---
+
+Step 7 — Create Environment Variables
+`.env`
+```
+PORT=5000
+
+NODE_ENV=development
+
+```
+
+Nothing more.
+
+We'll add Redis and PostgreSQL later.
+
+Don't add variables before you need them.
+
+
+---
+
+### Step 8 — Configure Scripts
+
+Open package.json.
+
+Replace scripts with
+
+```
+"scripts": {
+  "dev":"nodemon --watch src --exec tsx src/server.ts",
+  "build":"tsc",
+  "start":"node dist/server.js"
+}
+
+```
+
+---
+
+### Why build?
+Development
+
+```
+TypeScript
+
+↓
+
+tsx
+
+↓
+
+Run
+
+```
+
+Production
+
+```
+ TypeScript
+
+↓
+
+Compile
+
+↓
+
+JavaScript
+
+↓
+
+Run
+
+```
+
+Step 9 — Create app.ts
+```
+import express from "express";
+
+const app = express();
+
+app.use(express.json());
+
+export default app;
+
+```
+
+Simple.
+
+One responsibility.
+
+Configure Express.
+
+Nothing else.
+
+---
+
+### Why separate app.ts and server.ts?
+
+Many beginners do this.
+```
+server.ts
+
+Express
+
+Routes
+
+Database
+
+Redis
+
+Everything
+```
+
+After six months
+```
+3000 lines
+```
+
+Impossible to maintain.
+
+Instead
+```
+app.ts
+
+↓
+
+Configure Express
+
+Only
+```
+
+```
+server.ts
+
+↓
+
+Start Server
+
+```
+Single Responsibility Principle.
+
+---
+
+### Step 10 — Create server.ts
+
+```
+import dotenv from "dotenv";
+import app from "./app";
+
+dotenv.config();
+
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+    console.log(`Server running on ${PORT}`);
+});
+
+```
+
+Very clean.
+
+---
+
+Step 11 — Run server
+
+```
+npm run dev
+```
+Expected output
+
+```
+Server running on 5000
+```
+---
+
+Visit
+```
+http://localhost:5000
+```
+
+You'll get
+
+```
+Cannot GET /
+```
+
+This is actually good.
+
+It means
+
+ - Express is running
+ - Port is working
+ - Server started successfully
+
+---
+
+### What We Accomplished Today
+
+We built the `foundation`:
+
+```
+Node.js
+   │
+TypeScript
+   │
+Express
+   │
+Environment Variables
+   │
+Production Folder Structure
+
+```
+
+No unnecessary complexity.
+
+Every file has a purpose.
+
+---
+
+
+(Mandatory) Question 
+
+Before moving to Lecture 3, make sure you can answer:
+
+- Why do we separate app.ts from server.ts?
+- Why do we use tsx during development instead of compiling every time?
+- Why should secrets never be hardcoded?
+- Why is strict: true important in TypeScript?
+- Why don't we create folders that we don't need yet?
+
+
+---
+
+
+
 
 
 
