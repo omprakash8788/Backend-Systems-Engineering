@@ -1153,8 +1153,1223 @@ Before moving to Lecture 3, make sure you can answer:
 
 ---
 
+### Module 1 — Lecture 3
+### Building Our Local Infrastructure
+
+### Today's Goal
+
+By the end of this lecture, your laptop will look like this:
+
+```
+                    Docker Engine
+                         │
+     ┌───────────────────┼───────────────────┐
+     │                   │                   │
+     ▼                   ▼                   ▼
+ PostgreSQL          Redis             Mailpit (Later)
+     │                   │
+     └────────────┬──────┘
+                  │
+           Node.js Application
+
+```
+
+Notice something.
+
+Node.js does not contain Redis.
+
+Node.js does not contain PostgreSQL.
+
+They are completely different applications.
+
+---
+
+### First, Think Like an Engineer
+
+Suppose you're building Swiggy.
+
+You have
 
 
+```
+Order Service
+
+Payment Service
+
+Notification Service
+
+Analytics Service
+
+```
+
+Do you install PostgreSQL inside every service?
+No.
+
+All services connect to one PostgreSQL server.
+
+Same idea locally.
+
+---
+
+### Why Docker?
+
+Without Docker
+
+```
+Laptop
+
+↓
+
+Install PostgreSQL
+
+↓
+
+Install Redis
+
+↓
+
+Install Version X
+
+↓
+
+PATH Issues
+
+↓
+
+Port Conflicts
+
+↓
+
+"It works on my machine."
+
+```
+
+Everyone's laptop becomes different.
+
+---
+
+With Docker
+
+```
+Git Clone
+
+↓
+
+docker compose up
+
+↓
+
+Everything Works
+
+```
+
+Exactly the same environment for everyone.
+
+This is why companies use containers.
+
+---
+
+### What is a Container?
+
+Many beginners think
+
+ - Container = Virtual Machine
+
+Wrong.
+
+Think like this.
+
+```
+Windows
+│
+Docker Engine
+│
+├── PostgreSQL Container
+├── Redis Container
+├── Mailpit Container
+└── Bull Board (Later)
+
+```
+
+Every container is just an isolated process with its own filesystem and network.
+
+Much lighter than a VM.
+
+---
+
+### Our Project Structure
+
+We will slightly improve the structure.
+
+```
+background-job-system/
+
+src/
+
+docker/
+
+prisma/
+
+.env
+
+.env.example
+
+docker-compose.yml
+
+package.json
+
+README.md
+
+```
+
+Notice
+
+We keep Docker files separate from application code.
+
+---
+
+### Step 1 — Install Docker Desktop
+
+If Docker Desktop is already installed:
+
+```
+docker --version
+
+```
+
+Example 
+```
+Docker version 28.x.x
+```
+
+Now check
+```
+docker compose version
+```
+
+Example
+```
+Docker Compose version v2.x.x
+```
+
+If both commands work,
+
+you're ready.
+
+---
+
+### Step 2 — Create docker-compose.yml
+
+Create it in the project root.
+
+```
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:17
+    container_name: bg-postgres
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: background_jobs
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8
+
+    container_name: bg-redis
+
+    restart: unless-stopped
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+volumes:
+
+  postgres_data:
+
+  redis_data:
+
+```
+
+Don't worry about every line yet.
+
+We'll study every property.
+
+---
+
+### Step 3 — Why Volumes?
+
+Suppose Docker stores PostgreSQL here
+
+```
+Container
+
+↓
+
+Database
+
+```
+
+Now delete the container.
+
+Everything disappears.
+
+Bad.
+
+Instead
+```
+Container
+
+↓
+
+Volume
+
+↓
+
+Hard Disk
+```
+
+Now
+
+Delete container.
+
+Database still exists.
+
+This is how production works.
+
+---
+
+### Step 4 — Start Everything
+```
+docker compose up -d
+```
+Expected
+```
+Creating bg-postgres
+
+Creating bg-redis
+
+Started
+```
+
+---
+
+### Step 5 — Verify Containers
+```
+docker ps
+```
+Expected 
+```
+CONTAINER ID
+
+bg-postgres
+
+bg-redis
+
+```
+
+Both should show 
+```
+STATUS
+
+Up
+
+```
+
+### Step 6 — Understand Ports
+
+You wrote
+
+```
+5432:5432
+
+```
+Think
+```
+Host Machine
+
+5432
+
+↓
+
+Container
+
+5432
+```
+
+Redis
+
+```
+Host
+
+6379
+
+↓
+
+Container
+
+6379
+```
+
+Node connects to the host ports.
+
+---
+
+### Step 7 — Add Environment Variables
+.env
+```
+PORT=5000
+
+NODE_ENV=development
+
+DATABASE_URL="postgresql://postgres:postgres@localhost:5432/background_jobs"
+
+REDIS_HOST=localhost
+
+REDIS_PORT=6379
+```
+
+Notice
+
+No hardcoded values inside the code.
+
+Everything comes from .env.
+
+---
+### Step 8 — Test PostgreSQL
+
+Open a terminal.
+
+```
+docker exec -it bg-postgres psql -U postgres
+```
+Now 
+```
+\l
+```
+Expected
+```
+background_jobs
+postgres
+template0
+template1
+```
+
+Exit 
+```
+\q
+```
+
+---
+
+### Step 9 — Test Redis
+```
+docker exec -it bg-redis redis-cli
+```
+Now
+```
+PING
+```
+Expected
+```
+PONG
+```
+Now try
+```
+SET name omprakash
+```
+Expected 
+```
+ok
+```
+Read it
+```
+GET name
+```
+Output
+```
+"omprakash"
+```
+Exit 
+```
+exit
+```
+
+---
+
+### What Just Happened?
+
+You manually communicated with Redis.
+
+Later BullMQ will do exactly the same thing—just through code.
+
+---
+
+### Networking
+Our system now looks like this.
+```
+                  localhost
+
+         ┌──────────┼──────────┐
+         │          │          │
+         ▼          ▼          ▼
+     Node API   PostgreSQL   Redis
+      :5000       :5432       :6379
+```
+Nothing magical.
+
+Everything communicates over TCP.
+
+---
+
+### Debugging Skills
+
+Every backend engineer should know these commands.
+
+See running containers
+
+```
+docker ps
+```
+Stop everything
+```
+docker compose down
+```
+
+Start everything
+```
+docker compose up -d
+```
+
+View logs
+```
+docker logs bg-postgres
+```
+Redis logs
+```
+docker logs bg-redis
+```
+
+Restart one container
+```
+docker restart bg-redis
+
+```
+
+Enter PostgreSQL
+
+```
+docker exec -it bg-postgres psql -U postgres
+
+```
+Enter Redis
+```
+docker exec -it bg-redis redis-cli
+```
+
+These commands are used constantly in real projects.
+
+---
+### What We Built Today
+
+Today we didn't write business logic.
+
+Instead, we built reliable infrastructure.
+
+```
+Node.js API
+     │
+     ├──────────────┐
+     │              │
+     ▼              ▼
+PostgreSQL      Redis
+     │              │
+ Docker         Docker
+     │              │
+Persistent     Persistent
+ Volumes         Volumes
+```
+
+A strong backend starts with a strong foundation.
+
+---
+
+### Homework (Required)
+
+Don't continue until you can successfully complete all of these:
+
+✅ docker compose up -d
+✅ docker ps
+✅ Connect to PostgreSQL using psql
+✅ Connect to Redis using redis-cli
+✅ Run PING and receive PONG
+✅ Create a Redis key with SET
+✅ Read it back with GET
+
+If any of these fail, we'll debug them together before moving on.
+
+
+---
+
+### Module 1 — Lecture 4
+### Connecting Node.js to PostgreSQL and Redis
+
+### Today's Goal
+
+By the end of this lecture, our application should look like this:
+
+```
+                   Client
+                      │
+                      ▼
+              GET /health
+                      │
+                Express Server
+                      │
+        ┌─────────────┴─────────────┐
+        │                           │
+        ▼                           ▼
+   PostgreSQL                  Redis
+        │                           │
+      Connected                 Connected
+```
+
+### Step 1 — Why Connect at Startup?
+
+Many beginners do this:
+```
+app.get("/users", async () => {
+    // Connect Database
+});
+```
+Every request creates a new connection.
+
+This is terrible.
+
+Instead:
+```
+Application Starts
+
+↓
+
+Connect Database
+
+↓
+
+Connect Redis
+
+↓
+
+Ready to Accept Requests
+```
+If either service is unavailable, the application should fail fast instead of serving broken requests.
+
+### Step 2 — Install Dependencies
+
+```
+npm install prisma @prisma/client redis
+
+```
+
+Development dependency:
+```
+npm install -D prisma
+```
+---
+
+### Why Two Prisma Packages?
+
+prisma
+
+ - CLI
+ - migrations
+ - schema generation
+
+@prisma/client
+
+- used inside your application
+
+---
+### Step 3 — Initialize Prisma
+```
+npx prisma init
+```
+Expected structure:
+```
+prisma/
+
+    schema.prisma
+```
+Note - If you have already `prisma` folder then delete it, then run command.
+
+---
+
+### Step 4 — Configure Prisma
+
+Replace datasource:
+
+```
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+```
+Note - Do this inside `schema.prisma`
+
+Notice
+
+We never hardcode credentials.
+
+Everything comes from `.env.`
+
+---
+
+### Step 5 — Create First Model
+
+Let's keep it simple.
+
+```
+model HealthCheck {
+
+  id        Int      @id @default(autoincrement())
+
+  createdAt DateTime @default(now())
+}
+```
+
+Note - Write inside schema.prisma
+
+This table exists only so we can prove Prisma works.
+
+---
+
+### Step 6 — Run Migration
+```
+npx prisma migrate dev --name init
+```
+
+Note - After this command i got error , just beacuse prisma version issue, uninsatll latest prisma and install Prisma 6 
+
+```
+npm uninstall prisma @prisma/client
+
+```
+Then install Prisma 6:
+```
+npm install prisma@6 @prisma/client@6
+```
+
+Now run 
+```
+npx prisma generate
+```
+then
+```
+npx prisma migrate dev --name init
+```
+ - Also update password for postgress `inside .env`.
+
+Expected 
+```
+Migration applied
+
+Prisma Client Generated
+
+```
+
+Verify
+```
+npx prisma studio
+
+```
+
+Browser opens.
+
+Congratulations.
+
+You are connected to PostgreSQL.
+
+---
+
+### Step 7 — Create Config Folder
+Inside 
+
+```
+src/config/
+```
+Create
+```
+database.ts
+
+redis.ts
+```
+
+Why?
+
+Because configuration belongs in one place
+
+---
+
+### Step 8 — Database Configuration
+`src/config/database.ts`
+```
+import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient();
+
+```
+
+Looks simple.
+
+That's good.
+
+---
+
+### Why Singleton?
+
+Imagine this:
+
+```
+Request 1
+
+↓
+
+new PrismaClient()
+
+```
+
+```
+Request 2
+
+↓
+
+new PrismaClient()
+
+```
+Soon
+
+```
+500 requests
+
+↓
+
+500 database clients
+
+```
+
+Disaster.
+
+Instead
+```
+Application
+
+↓
+
+One Prisma Client
+
+↓
+
+Shared Everywhere
+```
+
+---
+
+### Step 9 — Redis Configuration
+`src/config/redis.ts`
+
+```
+import { createClient } from "redis";
+
+export const redis = createClient({
+    url: "redis://localhost:6379"
+});
+
+redis.on("connect", () => {
+    console.log("Redis Connected");
+});
+
+redis.on("error", (err) => {
+    console.error(err);
+});
+```
+
+Later we'll improve this using environment variables.
+
+For now, keep it simple.
+
+---
+
+### Step 10 — Connect on Startup
+
+Update server.ts
+
+```
+import dotenv from "dotenv";
+import app from "./app";
+import { redis } from "./config/redis";
+import { prisma } from "./config/database";
+
+dotenv.config();
+
+const PORT = process.env.PORT || 5000;
+
+async function startServer() {
+    try {
+
+        await prisma.$connect();
+
+        await redis.connect();
+
+        app.listen(PORT, () => {
+            console.log(`Server running on ${PORT}`);
+        });
+
+    } catch (error) {
+
+        console.error("Startup Failed", error);
+
+        process.exit(1);
+    }
+}
+
+startServer();
+```
+
+Notice
+
+The server starts only after both dependencies are available.
+
+---
+
+### Why is This Better?
+
+Bad architecture
+
+```
+Server Starts
+
+↓
+
+Users Send Requests
+
+↓
+
+Database Missing
+
+↓
+
+500 Errors
+
+```
+
+Good architecture 
+```
+Start
+
+↓
+
+Database OK?
+
+↓
+
+Redis OK?
+
+↓
+
+YES
+
+↓
+
+Accept Requests
+```
+
+---
+
+### Step 11 — Build a Health Endpoint
+
+Inside
+
+```
+routes/
+
+controllers/
+
+```
+
+create 
+```
+health.routes.ts
+
+health.controller.ts
+
+```
+
+Controller
+```
+import { Request, Response } from "express";
+
+export const getHealth = async (_req: Request, res: Response) => {
+
+    res.status(200).json({
+
+        status: "UP",
+
+        timestamp: new Date().toISOString()
+
+    });
+
+};
+
+```
+Route
+```
+import { Router } from "express";
+import { getHealth } from "../controllers/health.controller";
+
+const router = Router();
+
+router.get("/", getHealth);
+
+export default router;
+```
+
+Register it in `app.ts`
+
+```
+import healthRoutes from "./routes/health.routes";
+
+app.use("/health", healthRoutes);
+
+```
+
+---
+
+Visit
+```
+GET
+
+http://localhost:5000/health
+```
+
+Note - Pay attention , `npm uninstall redis` and `npm install ioredis`
+Why - redis create issue while handshake connection was not done- After that we come on the final decision to relaced it.
+
+Update `redis.ts`
+```
+import Redis from "ioredis";
+
+export const redis = new Redis({
+    host: "127.0.0.1",
+    port: 6379,
+});
+
+redis.on("connect", () => {
+    console.log("✅ Redis Connected");
+});
+
+redis.on("ready", () => {
+    console.log("✅ Redis Ready");
+});
+
+redis.on("error", (err:any) => {
+    console.error("Redis Error:", err);
+});
+```
+
+Note -`Notice there is no connect() call.`
+
+Change your server.ts
+
+Remove `await redis.connect();`
+
+because ioredis connects automatically.
+
+***server.ts***
+```
+import dotenv from "dotenv";
+import app from "./app.js";
+import { redis } from "./config/redis.js"; // Just for test
+import { prisma } from "./config/database.js";
+
+dotenv.config();
+
+const PORT = process.env.PORT || 5000;
+
+async function startServer() {
+    try {
+
+        await prisma.$connect();
+        const pong = await redis.ping()
+        console.log(pong) 
+
+        app.listen(PORT, () => {
+            console.log(`Server running on ${PORT}`);
+        });
+
+    } catch (error) {
+
+        console.error("Startup Failed", error);
+
+        process.exit(1);
+    }
+}
+
+startServer();
+
+```
+
+### Why I'm choosing ioredis
+
+Since we're building a production-grade backend with background workers, retries, queues, and Redis, I want us to focus on backend architecture rather than spending time on what appears to be a client-specific issue.
+
+---
+
+```
+
+GET
+
+http://localhost:5000/health
+
+```
+Expected 
+```
+{
+  "status":"UP",
+  "timestamp":"2026-08-06T17:20:00Z"
+}
+```
+Great.
+
+API works
+
+---
+
+### Step 12 — Production Health Check
+
+Now let's improve it.
+
+```
+import { Request, Response } from 'express'
+
+export const getHealth = async (_req: Request, res: Response) => {
+    res.status(200).json({
+        status: "UP",
+        "services": {
+            "database": "UP",
+
+            "redis": "UP"
+        },
+         "uptime":154,
+        timestamp: new Date().toISOString()
+    });
+}
+
+
+```
+
+Later we'll check each dependency dynamically.
+
+This is what Kubernetes, Docker, and load balancers use to know whether your service is healthy.
+
+---
+
+### Step 13 — Testing
+
+### Test 1
+
+Stop Redis
+
+```
+docker stop bg-redis
+```
+
+Run server.
+
+Expected
+
+```
+Startup Failed
+```
+
+Perfect.
+
+---
+
+### Test 2
+
+Start Redis.
+
+Stop PostgreSQL.
+
+```
+docker stop bg-postgres
+```
+Expected
+
+```
+Startup Failed
+```
+Again, correct.
+
+---
+
+Test 3
+
+Start both.
+```
+docker compose up -d
+```
+Server starts normally.
+
+---
+
+### What You Learned Today
+
+You now know:
+
+- How to connect Prisma once.
+- How to connect Redis once.
+- Why singleton clients matter.
+- Why applications should fail fast.
+- How health endpoints work.
+- How startup orchestration works.
+
+These are patterns you'll reuse for PostgreSQL, Redis, Kafka, RabbitMQ, Elasticsearch, S3, and many other services.
+
+---
+
+Homework
+
+Before Lecture 5, verify all of these:
+
+✅ prisma migrate dev completes successfully.
+✅ prisma.$connect() succeeds.
+✅ Redis connects successfully.
+✅ /health returns 200 OK.
+✅ Stopping Redis prevents startup.
+✅ Stopping PostgreSQL prevents startup.
+✅ Restarting both allows the server to start again.
+
+Do not move on until every check passes.
 
 
 
