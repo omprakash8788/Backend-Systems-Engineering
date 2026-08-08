@@ -1,18 +1,26 @@
 import Redis from "ioredis";
+import { logger } from "../logger/index.js";
+import { env } from "./env.js";
 
 export const redis = new Redis({
-    host: "127.0.0.1",
-    port: 6379,
+    host: env.REDIS_HOST,
+    port: env.REDIS_PORT,
+
+    maxRetriesPerRequest: null,
 });
 
 redis.on("connect", () => {
-    console.log("✅ Redis Connected");
+    logger.info("✅ Redis Connected");
 });
 
 redis.on("ready", () => {
-    console.log("✅ Redis Ready");
+    logger.info("✅ Redis Ready");
 });
 
-redis.on("error", (err:any) => {
-    console.error("Redis Error:", err);
+redis.on("error", (error:any) => {
+    logger.error(error);
+});
+
+redis.on("close", () => {
+    logger.warn("Redis Connection Closed");
 });
