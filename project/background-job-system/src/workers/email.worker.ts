@@ -1,0 +1,58 @@
+import { Worker, Job } from "bullmq";
+import {redis} from "../config/redis.js"
+import { logger } from "../logger/index.js";
+
+interface EmailJobData{
+    email:string;
+}
+
+const emailWorker = new Worker<EmailJobData>(
+    "email-queue",
+    async (job:Job<EmailJobData>)=>{
+        logger.info({
+            jobId:job.id,
+            email:job.data.email,
+            attempt:job.attemptsMade + 1
+
+        }, "Processing email job");
+
+         // Intentionally fail this job
+        if (job.data.email === "fail@gmail.com") {
+            throw new Error("Simulated email provider failure");
+        }
+
+        // Simulate email processing
+        await new Promise((resolve)=>{
+            setTimeout(resolve, 2000);
+        })
+        logger.info({
+            jobId:job.id,
+
+        }, "Email process successfully")
+    },
+    {
+        connection:redis,
+    }
+
+);
+
+emailWorker.on("completed", (job)=>{
+    logger.info({
+        jobId:job.id,
+    }, "Job completed")
+});
+
+emailWorker.on("failed", (job, error)=>{
+    logger.error({
+        jobId:job?.id,
+         attemptsMade: job?.attemptsMade,
+        error:error.message,
+    }, "Job failed")
+});
+
+
+logger.info("Email worker started")
+
+
+
+
