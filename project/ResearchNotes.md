@@ -4588,5 +4588,2408 @@ Because Redis acts as a fast, durable intermediary between producers (your API) 
 
 ---
 
+### Small Improvement Before Next Lecture
+
+One thing we'll improve in the next lecture is the route structure.
+
+Instead of:
+```
+app.use(emailRoutes);
+```
+
+we'll use a versioned API:
+```
+app.use("/api/v1/emails", emailRoutes);
+```
+
+and inside `email.routes.ts:`
+
+```
+router.post("/", sendEmail);
+```
+
+This produces cleaner URLs:
+```
+POST /api/v1/emails
+```
+
+---
+
+### Module 1 — Lecture 6.4
+### Creating Our First Worker
+
+Until now, we have built only the `producer side:`
+
+```
+Client
+   │
+   ▼
+Express API
+   │
+   ▼
+emailQueue.add()
+   │
+   ▼
+Redis
+   │
+   ▼
+WAITING
+
+```
+
+But nobody is consuming the job.
+
+That's what a `Worker` does.
+
+Today we'll build:
+
+```
+                    ┌──────────────┐
+                    │  Node API    │
+                    │  Producer    │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │    Redis     │
+                    │    Queue     │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │    Worker    │
+                    │   Consumer   │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    Process Email Job
+```
+
+---
+
+### Important Architecture Decision
+
+Before coding, understand this:
+
+#### The API process and Worker process should be separate processes.
+
+Don't do this:
+
+```
+server.ts
+   │
+   ├── Express
+   ├── Redis
+   └── Worker
+```
+
+Instead:
+```
+API PROCESS
+   │
+   └── Express
+         │
+         ▼
+       Redis
+         ▲
+         │
+WORKER PROCESS
+   │
+   └── BullMQ Worker
+```
+
+Why?
+
+Because if email processing becomes CPU-heavy, the API shouldn't become slow.
+
+Later we can run:
+
+```
+API × 3
+
+Worker × 10
+
+```
+
+independently.
+
+That is the beginning of horizontal scaling.
+
+---
+
+### Step 1 — Create the Worker File
+
+Create this folder if it doesn't exist:
+
+```
+background-job-system/
+└── src/
+    └── workers/
+```
+
+Now create:
+```
+src/workers/email.worker.ts
+```
+
+This file's responsibility is:
+
+ - Consume jobs from email-queue and process them.
+
+---
+
+### Step 2 — Write the Worker
+
+Open:
+`src/workers/email.worker.ts`
+
+Write:
+
+```
+import { Worker, Job } from "bullmq";
+import { redis } from "../config/redis";
+import { logger } from "../logger";
+
+interface EmailJobData {
+    email: string;
+}
+
+const emailWorker = new Worker<EmailJobData>(
+    "email-queue",
+
+    async (job: Job<EmailJobData>) => {
+
+        logger.info({
+            jobId: job.id,
+            email: job.data.email,
+        }, "Processing email job");
+
+        // Simulate email processing
+        await new Promise((resolve) => {
+            setTimeout(resolve, 2000);
+        });
+
+        logger.info({
+            jobId: job.id,
+        }, "Email processed successfully");
+    },
+
+    {
+        connection: redis,
+    }
+);
+
+emailWorker.on("completed", (job) => {
+
+    logger.info({
+        jobId: job.id,
+    }, "Job completed");
+
+});
+
+emailWorker.on("failed", (job, error) => {
+
+    logger.error({
+        jobId: job?.id,
+        error: error.message,
+    }, "Job failed");
+
+});
+
+logger.info("Email worker started");
+```
+
+---
+
+### Step 3 — Understand the Important Part
+
+This line:
+```
+new Worker<EmailJobData>(
+    "email-queue",
+```
+
+is extremely important.
+
+We previously created:
+
+```
+new Queue("email-queue")
+```
+
+Now our worker uses:
+```
+"email-queue"
+```
+
+The names must match.
+
+```
+Queue
+  │
+  │ "email-queue"
+  ▼
+Redis
+  ▲
+  │
+  │ "email-queue"
+Worker
+```
+
+If you accidentally write:
+```
+new Worker("emailQueue")
+```
+instead of:
+```
+new Worker("email-queue")
+```
+they are different queues.
+
+---
+
+### Step 4 — Understand the Processor
+
+This part:
+```
+async (job) => {
+```
+is the actual background processing function.
+
+When BullMQ finds a waiting job:
+
+```
+Redis
+
+Job #1
+{
+   email: "abc@gmail.com"
+}
+```
+
+BullMQ gives it to:
+```
+async (job) => {
+```
+
+Then we can access:
+```
+job.id
+```
+
+and 
+```
+job.data.email
+```
+
+For example
+```
+job.id
+
+1
+```
+
+and:
+```
+job.data.email
+
+abc@gmail.com
+
+```
+
+---
+
+### Step 5 — Why Did We Use an Interface?
+
+We wrote:
+
+```
+interface EmailJobData {
+    email: string;
+}
+```
+
+Therefore:
+```
+job.data.email
+```
+
+is known by TypeScript to be:
+```
+string
+```
+
+This is much safer than:
+```
+job.data.whatever
+```
+
+TypeScript can catch mistakes before production.
+
+---
+
+### Step 6 — The `setTimeout`
+
+We currently have:
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 2000);
+});
+
+```
+
+This is` not actually sending an email.`
+
+We're deliberately simulating a slow background operation.
+
+Imagine:
+```
+Send Email
+Generate PDF
+Resize Image
+Process Video
+Generate Report
+Call External API
+```
+These operations may take time.
+
+Our simulation takes:
+
+```
+2 seconds
+```
+
+This lets us observe the worker properly.
+
+---
+
+### Step 7 — Create a Worker Start Script
+
+We don't want to start the worker whenever we start the API.
+
+Create a new file:
+```
+src/worker.ts
+```
+
+Write:
+```
+import "./workers/email.worker";
+```
+
+That's it.
+
+This file is the `entry point for the worker process.`
+
+---
+
+### Why Have `server.ts` AND `worker.ts?`
+
+Because they represent different processes.
+
+```
+src/server.ts
+       │
+       ▼
+    API PROCESS
+       │
+    Express
+```
+and:
+```
+src/worker.ts
+       │
+       ▼
+  WORKER PROCESS
+       │
+    BullMQ
+```
+
+This separation is extremely important.
+
+---
+
+### Step 8 — Add Worker Script
+
+Open:
+```
+package.json
+```
+
+Find:
+```
+"scripts": {
+```
+
+Change it to:
+```
+"scripts": {
+    "dev": "nodemon --watch src --exec tsx src/server.ts",
+    "dev:worker": "nodemon --watch src --exec tsx src/worker.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "start:worker": "node dist/worker.js"
+}
+```
+
+Now we have two processes.
+
+### API
+```
+npm run dev
+```
+
+### Worker 
+```
+npm run dev:worker
+```
+
+---
+
+### Step 9 — Start Redis
+
+Before testing:
+
+```
+docker compose up -d
+```
+
+Check :
+```
+docker ps
+```
+
+you should see:
+```
+bg-postgres
+bg-redis
+```
+---
+
+### Step 10 — Start the API
+
+Terminal 1:
+
+```
+npm run dev
+```
+Expected:
+```
+Redis Connected
+Redis Ready
+Server running on port 5000
+```
+
+Keep this terminal running.
+
+---
+
+### Step 11 — Start the Worker
+
+Open another terminal.
+
+Inside the same project:
+
+```
+npm run dev:worker
+```
+
+Expected:
+
+```
+Email worker started
+```
+
+You now here:
+```
+Terminal 1
+
+API
+│
+└── Express
+```
+
+and:
+```
+Terminal 2
+
+Worker
+│
+└── BullMQ Worker
+
+```
+
+This is important.
+
+`Do not close either terminal.`
+
+---
+
+### Step 12 — Create a Job
+
+Use Postman or PowerShell.
+
+Request
+
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+
+```
+JSON
+
+{
+    "email": "abc@gmail.com"
+}
+
+```
+
+Expected API response:
+```
+{
+    "success": true,
+    "message": "Job Added Successfully"
+}
+```
+---
+
+
+### Step 13 — Watch the Worker
+
+Look at Terminal 2.
+
+You should see something similar to:
+```
+Email worker started
+
+Processing email job
+    jobId: 1
+    email: abc@gmail.com
+```
+
+Wait approximately 2 seconds
+
+Then:
+
+```
+Email processed successfully
+```
+
+and:
+```
+Job completed
+```
+
+🎉
+
+You have just built your first background job system.
+
+---
+
+### Step 14 — Understand What Just Happened
+
+The API received:
+
+```
+POST /send-email
+```
+
+Then:
+```
+await emailQueue.add("send-email", {
+    email,
+});
+```
+
+The API didn't process the email.
+
+Instead:
+
+```
+API
+ │
+ │ Add Job
+ ▼
+Redis
+ │
+ │ Waiting
+ ▼
+Worker
+ │
+ │ Process
+ ▼
+Completed
+```
+
+This is the fundamental architecture we'll build on.
+
+---
+
+### Step 15 — Test the Most Important Property
+
+Now let's prove that the API and worker are actually independent.
+
+#### Stop the worker
+
+In Terminal 2:
+```
+Ctrl + C
+```
+Worker stops.
+
+---
+
+Keep API running
+
+Terminal 1 should still show:
+
+```
+Server running on port 5000
+```
+
+Now send
+```
+POST /send-email
+```
+
+again.
+```
+{
+    "email": "second@gmail.com"
+}
+```
+
+API should still respond:
+```
+{
+    "success": true,
+    "message": "Job Added Successfully"
+}
+```
+
+But no email is processed.
+
+Why?
+
+Because:
+```
+API
+ │
+ ▼
+Redis
+ │
+ ▼
+Waiting Job
+```
+
+There is no worker.
+
+---
+
+### Step 16 — Start Worker Again
+
+Run:
+
+```
+npm run dev:worker
+```
+
+Watch Terminal 2.
+
+The worker should pick up the waiting job.
+
+You should see:
+
+```
+Watch Terminal 2.
+
+The worker should pick up the waiting job.
+
+You should see:
+```
+
+then:
+```
+Email processed successfully
+```
+
+This is a `very important test.`
+
+It proves Redis is acting as the intermediary.
+
+---
+
+### The Architecture You Just Built
+
+```
+
+                    ┌──────────────────┐
+                    │      Client      │
+                    └────────┬─────────┘
+                             │
+                             │ HTTP
+                             ▼
+                    ┌──────────────────┐
+                    │   Node.js API    │
+                    │                  │
+                    │ Express          │
+                    │ Producer         │
+                    └────────┬─────────┘
+                             │
+                             │ add()
+                             ▼
+                    ┌──────────────────┐
+                    │      Redis       │
+                    │                  │
+                    │  email-queue     │
+                    │                  │
+                    │    WAITING       │
+                    └────────┬─────────┘
+                             │
+                             │ consume
+                             ▼
+                    ┌──────────────────┐
+                    │      Worker      │
+                    │                  │
+                    │     BullMQ       │
+                    │     Consumer     │
+                    └────────┬─────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │  Email Service   │
+                    │    (Later)       │
+                    └──────────────────┘
+
+```
+
+---
+
+### Very Important Concept: Producer vs Consumer
+
+The API is the:
+
+### Producer
+
+It produces jobs.
+
+```
+emailQueue.add(...)
+```
+
+The worker is the:
+
+### Consumer
+
+It consumes jobs.
+
+```
+new Worker(...)
+```
+
+This distinction is fundamental to distributed systems.
+
+---
+
+### What Happens If 1,000 Jobs Arrive?
+
+Suppose:
+```
+1000 requests
+```
+
+come in.
+
+API:
+
+```
+Job 1 ─┐
+Job 2 ─┤
+Job 3 ─┤
+Job 4 ─┤
+...    ├──> Redis
+Job 999│
+Job1000┘
+```
+
+Worker processes them.
+
+If one worker isn't fast enough, later we can run:
+
+```
+Worker 1
+Worker 2
+Worker 3
+Worker 4
+Worker 5
+```
+
+all consuming from the same queue.
+
+```
+                    Redis
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+       Worker 1    Worker 2    Worker 3
+```
+
+That's horizontal worker scaling.
+
+We'll get there.
+
+---
+
+### One Important Production Problem
+
+Our current worker has this:
+
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 2000);
+});
+```
+
+But what happens if the worker crashes?
+
+Or:
+```
+SMTP server unavailable
+```
+
+Or:
+```
+Email provider returns 500
+```
+
+We need:
+```
+Retry
+```
+
+That's why earlier we configured:
+```
+attempts: 3
+```
+
+But we haven't tested it yet.
+
+That will be our next major lesson.
+
+---
+
+### Module 1 — Lecture 6.5
+### Job Failures, Retries & Backoff
+
+Our system currently works:
+```
+Client
+  │
+  ▼
+API
+  │
+  ▼
+Redis
+  │
+  ▼
+Worker
+  │
+  ▼
+Success
+```
+
+But production systems don't live in a perfect world.
+
+External services fail.
+
+```
+SMTP unavailable
+Payment provider timeout
+Database temporarily unavailable
+Third-party API returns 500
+Network failure
+Worker crashes
+```
+
+So we need:
+
+```
+Job
+ │
+ ▼
+Attempt 1
+ │
+ ├── Success → Completed
+ │
+ └── Failure
+       │
+       ▼
+    Retry
+       │
+       ▼
+    Attempt 2
+       │
+       ├── Success → Completed
+       │
+       └── Failure
+             │
+             ▼
+          Attempt 3
+             │
+             ├── Success → Completed
+             │
+             └── Failure
+                   │
+                   ▼
+                 Failed
+```
+
+### Today's Goal
+
+We'll implement and test:
+
+attempts
+backoff
+failed jobs
+retry behavior
+attemptsMade
+completed jobs
+permanently failed jobs
+
+And, importantly, we'll observe the behavior ourselves.
+
+---
+
+### Step 0 — Make Sure Previous Lecture Works
+
+Before changing anything, start Redis:
+
+```
+docker compose up -d
+
+```
+
+Check:
+```
+docker ps
+```
+You should have:
+```
+bg-postgres
+bg-redis
+```
+
+Terminal 1 — API
+```
+npm run dev
+```
+
+---
+
+Terminal 2 — Worker
+```
+npm run dev:worker
+```
+
+You should see something like:
+
+```
+Redis Connected
+Redis Ready
+Server running on port 5000
+```
+
+and:
+```
+Email worker started
+
+```
+
+If your previous lecture isn't working, `don't implement today's changes yet.` Fix that first.
+
+---
+
+### Step 1 — Modify the Queue
+
+Open this exact file:
+
+```
+background-job-system/
+└── src/
+    └── queues/
+        └── email.queue.ts    <-- OPEN THIS
+
+```
+
+Currently you have something similar to:
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis";
+
+export const emailQueue = new Queue("email-queue", {
+    connection: redis,
+    defaultJobOptions: {
+        attempts: 3,
+        removeOnComplete: 100,
+        removeOnFail: 500,
+    },
+});
+```
+
+We're going to add backoff.
+
+Replace the file with:
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis";
+
+export const emailQueue = new Queue("email-queue", {
+    connection: redis,
+
+    defaultJobOptions: {
+        attempts: 3,
+
+        backoff: {
+            type: "exponential",
+            delay: 1000,
+        },
+
+        removeOnComplete: 100,
+
+        removeOnFail: 500,
+    },
+});
+```
+
+---
+
+### Step 2 — Understand attempts
+
+This:
+```
+attempts: 3
+```
+
+means BullMQ can execute the job up to `three times.`
+
+For example:
+```
+Attempt 1
+   ↓
+Failed
+
+Attempt 2
+   ↓
+Failed
+
+Attempt 3
+   ↓
+Failed
+
+Final state = failed
+```
+
+If attempt 2 succeeds:
+```
+Attempt 1
+   ↓
+Failed
+
+Attempt 2
+   ↓
+Success
+
+Final state = completed
+```
+
+---
+
+### Step 3 — Understand Backoff
+
+We added:
+```
+backoff: {
+    type: "exponential",
+    delay: 1000,
+}
+
+```
+This means BullMQ doesn't immediately retry.
+
+It waits.
+
+Conceptually:
+```
+Attempt 1
+   ↓
+FAIL
+   ↓
+wait
+   ↓
+Attempt 2
+   ↓
+FAIL
+   ↓
+wait longer
+   ↓
+Attempt 3
+
+```
+
+Exponential backoff is useful because immediately hammering an already-failing external service is often a bad idea.
+
+For our example, the delays grow roughly like:
+```
+1 second
+2 seconds
+4 seconds
+...
+```
+
+The exact scheduling can also be affected by queue timing and worker availability.
+
+---
+
+### Step 4 — We Need a Job That Fails
+
+Right now our worker always succeeds.
+
+Open:
+```
+background-job-system/
+└── src/
+    └── workers/
+        └── email.worker.ts    <-- OPEN THIS
+```
+
+Currently you have:
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 2000);
+});
+```
+
+We're going to make the worker intentionally fail for a particular email.
+
+Replace the processor with:
+
+```
+import { Worker, Job } from "bullmq";
+import { redis } from "../config/redis";
+import { logger } from "../logger";
+
+interface EmailJobData {
+    email: string;
+}
+
+const emailWorker = new Worker<EmailJobData>(
+    "email-queue",
+
+    async (job: Job<EmailJobData>) => {
+
+        logger.info({
+            jobId: job.id,
+            email: job.data.email,
+            attempt: job.attemptsMade + 1,
+        }, "Processing email job");
+
+        // Intentionally fail this job
+        if (job.data.email === "fail@gmail.com") {
+            throw new Error("Simulated email provider failure");
+        }
+
+        // Simulate email processing
+        await new Promise((resolve) => {
+            setTimeout(resolve, 2000);
+        });
+
+        logger.info({
+            jobId: job.id,
+        }, "Email processed successfully");
+    },
+
+    {
+        connection: redis,
+    }
+);
+
+emailWorker.on("completed", (job) => {
+
+    logger.info({
+        jobId: job.id,
+    }, "Job completed");
+
+});
+
+emailWorker.on("failed", (job, error) => {
+
+    logger.error({
+        jobId: job?.id,
+        attemptsMade: job?.attemptsMade,
+        error: error.message,
+    }, "Job failed");
+
+});
+
+logger.info("Email worker started");
+
+```
+---
+
+### Step 5 — Why throw?
+
+This is critical.
+
+We have:
+
+```
+throw new Error("Simulated email provider failure");
+
+```
+
+BullMQ interprets a thrown error from the processor as:
+
+  - The job failed.
+
+Then BullMQ applies our retry policy.
+
+```
+Worker
+  │
+  ▼
+throw Error
+  │
+  ▼
+BullMQ detects failure
+  │
+  ▼
+Retry policy
+```
+
+Don't manually do:
+
+```
+emailQueue.add(...)
+```
+
+again inside the worker.
+
+BullMQ handles the retry.
+
+---
+
+### Step 6 — Restart the Worker
+
+Because we're using nodemon, it should restart automatically.
+
+If necessary:
+
+```
+Ctrl + C
+```
+then:
+```
+npm run dev:worker
+```
+
+Expected:
+```
+Email worker started
+```
+
+---
+
+### Step 7 — Test a Successful Job First
+
+Send:
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+```
+{
+    "email": "success@gmail.com"
+}
+```
+
+Expected worker behavior:
+
+```
+Processing email job
+       ↓
+2 seconds
+       ↓
+Email processed successfully
+       ↓
+Job completed
+```
+
+So our existing system still works.
+
+---
+
+### Step 8 — Now Break It
+
+Send:
+
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+```
+{
+    "email": "fail@gmail.com"
+}
+
+```
+
+The API will still respond:
+
+```
+{
+    "success": true,
+    "message": "Job Added Successfully"
+}
+```
+
+This is important.
+
+The API's job was only to enqueue the job.
+
+---
+
+### Step 9 — Watch the Worker
+
+Now look at your worker terminal.
+
+You should see approximately:
+
+```
+Processing email job
+jobId: 2
+attempt: 1
+```
+
+Then:
+```
+Job failed
+attemptsMade: 1
+error: Simulated email provider failure
+```
+
+BullMQ waits according to the backoff policy.
+
+Then:
+```
+Processing email job
+jobId: 2
+attempt: 2
+```
+
+It fails again.
+
+Then:
+
+```
+Processing email job
+jobId: 2
+attempt: 3
+```
+
+It fails again.
+
+Finally:
+
+```
+Job failed
+```
+
+The job is now permanently failed according to our configured three attempts.
+
+---
+
+### Step 10 — Important Distinction
+
+You may notice:
+
+```
+job.attemptsMade
+```
+
+and:
+```
+job.opts.attempts
+
+```
+These mean different things.
+
+`attempts`
+
+Maximum number of attempts.
+
+```
+3
+```
+`attemptsMade`
+
+How many attempts have already happened.
+
+For example:
+
+```
+Before processing:
+attemptsMade = 0
+
+After first failure:
+attemptsMade = 1
+
+After second failure:
+attemptsMade = 2
+
+After third failure:
+attemptsMade = 3
+
+```
+
+That's why we wrote:
+
+```
+attempt: job.attemptsMade + 1
+```
+
+while logging the current execution.
+
+---
+
+### Step 11 — Inspect Redis
+
+Now let's look underneath BullMQ.
+
+Open another terminal:
+
+```
+docker exec -it bg-redis redis-cli
+
+```
+
+Run:
+```
+KEYS bull:email-queue:*
+```
+
+You should see keys related to the queue.
+
+Because we configured:
+```
+removeOnFail: 500
+
+```
+the failed job should remain available for inspection.
+
+---
+
+### Step 12 — Don't Guess the Job Key
+
+Earlier we used:
+
+```
+HGETALL bull:email-queue:1
+
+```
+That was okay for our first job, but don't build production debugging habits around guessing IDs.
+
+First discover the queue's job IDs:
+```
+ZRANGE bull:email-queue:failed 0 -1
+
+127.0.0.1:6379> ZRANGE bull:email-queue:failed 0 -1
+
+```
+
+You should see failed job IDs, for example:
+
+```
+2
+```
+
+Then 
+```
+HGETALL bull:email-queue:6
+```
+
+You should see information about that job.
+
+Depending on the BullMQ version and job state, the exact Redis keys and fields may vary, so use BullMQ's APIs for application-level inspection rather than hardcoding Redis internals.
+
+---
+
+### Step 13 — Understand the Job Lifecycle
+
+We can now visualize the lifecycle.
+
+```
+                    add()
+                     │
+                     ▼
+                  WAITING
+                     │
+                     ▼
+                  ACTIVE
+                     │
+             ┌───────┴────────┐
+             │                │
+           Success           Error
+             │                │
+             ▼                ▼
+         COMPLETED          RETRY
+                              │
+                              ▼
+                           WAITING
+                              │
+                              ▼
+                           ACTIVE
+                              │
+                         ┌────┴────┐
+                         │         │
+                      Success    Failure
+                         │         │
+                         ▼         ▼
+                    COMPLETED    FAILED
+```
+
+
+This state machine is one of the most important concepts in job processing.
+
+---
+
+### Step 14 — Why Retries Matter
+
+Imagine this real scenario:
+
+```
+Your Worker
+     │
+     ▼
+Stripe API
+     │
+     X
+Temporary network failure
+```
+
+Without retry:
+
+```
+Payment Job
+    ↓
+Failure
+    ↓
+Lost
+```
+
+With retry:
+```
+Payment Job
+    ↓
+Failure
+    ↓
+Wait
+    ↓
+Retry
+    ↓
+Success
+```
+
+Temporary failures become recoverable.
+
+---
+
+### But Retries Are NOT Always Safe
+
+This is a very important production concept.
+
+Imagine:
+
+```
+Charge Credit Card
+```
+Worker sends request:
+```
+₹1,000 charge
+```
+
+Stripe successfully charges the customer.
+
+But your worker crashes `before recording the successful result.`
+
+BullMQ retries.
+
+You might accidentally charge the customer twice.
+
+Therefore:
+ -Retries require idempotent job processing.
+
+We'll study idempotency later in this project.
+
+This is one of the differences between a toy queue system and a production-grade one.
+
+---
+
+### Step 15 — Test Worker Recovery
+
+Let's do a very useful test.
+
+Start worker.
+
+```
+npm run dev:worker
+
+```
+
+### Send a failing job.
+```
+{
+    "email": "fail@gmail.com"
+}
+```
+
+### Immediately stop the worker.
+
+```
+Ctrl + C
+```
+
+Now the worker is gone.
+
+Redis still contains the job state.
+
+Start worker again:
+
+```
+npm run dev:worker
+```
+
+BullMQ will continue managing the job according to its state and retry configuration.
+
+This is why we don't store job state only in Node.js memory.
+
+---
+
+### What Redis Is Really Giving Us
+
+Without Redis:
+
+```
+API
+ │
+ ▼
+Worker memory
+
+```
+Worker crashes:
+
+```
+Worker crashes:
+```
+
+Job information can disappear.
+
+With Redis:
+```
+API
+ │
+ ▼
+Redis
+ │
+ ▼
+Worker
+
+
+```
+
+Worker crashes:
+```
+💥 Worker
+   │
+   ▼
+Redis still has state
+   │
+   ▼
+New Worker
+```
+
+That's the foundation of durability and decoupling in our system.
+
+---
+
+### Step 16 — One Production Improvement
+
+Our queue currently has:
+
+```
+attempts: 3
+
+```
+
+and:
+
+```
+backoff: {
+    type: "exponential",
+    delay: 1000,
+}
+```
+
+This is a reasonable starting point, but production systems often make retry policies `job-specific.`
+
+For example:
+```
+Email
+→ 5 attempts
+
+Webhook
+→ 8 attempts
+
+Image processing
+→ 3 attempts
+
+Payment
+→ carefully controlled retries
+```
+
+We'll eventually move toward a more deliberate retry strategy instead of one global setting.
+
+---
+
+### Your Current Project Structure
+
+At this point, you should have:
+
+```
+background-job-system/
+│
+├── src/
+│   │
+│   ├── config/
+│   │   ├── database.ts
+│   │   ├── env.ts
+│   │   └── redis.ts
+│   │
+│   ├── controllers/
+│   │   └── email.controller.ts
+│   │
+│   ├── queues/
+│   │   └── email.queue.ts
+│   │
+│   ├── routes/
+│   │   └── email.routes.ts
+│   │
+│   ├── workers/
+│   │   └── email.worker.ts
+│   │
+│   ├── logger/
+│   │   └── index.ts
+│   │
+│   ├── app.ts
+│   ├── server.ts
+│   └── worker.ts
+│
+├── prisma/
+│   └── schema.prisma
+│
+├── .env
+├── docker-compose.yml
+├── package.json
+└── tsconfig.json
+```
+
+---
+
+### Module 1 — Lecture 6.6
+
+#### Delayed Jobs
+
+Now we're adding another important capability to our background-job system:
+
+ - `Tell the queue: "Do not process this job yet."`
+
+This is different from a retry.
+
+---
+
+### 1. First understand the difference
+
+### Normal job
+```
+API
+ ↓
+Queue
+ ↓
+Worker
+ ↓
+Process immediately
+```
+
+### Delayed job
+```
+API
+ ↓
+Queue
+ ↓
+WAIT 30 seconds
+ ↓
+Worker
+ ↓
+Process
+```
+
+Retry 
+
+```
+Worker
+ ↓
+Job fails
+ ↓
+Wait
+ ↓
+Try again
+```
+
+So:
+
+| Feature   | Purpose                               |
+| --------- | ------------------------------------- |
+| `delay`   | Don't start the job yet               |
+| `retry`   | Job already failed; try again         |
+| `backoff` | Control how long to wait before retry |
+
+---
+
+### 2. Real Production Example
+
+Imagine a user signs up.
+
+We want:
+
+```
+User signs up
+      ↓
+Send welcome email immediately
+      ↓
+Wait 24 hours
+      ↓
+Send "How are you finding our product?"
+      ↓
+Wait 7 days
+      ↓
+Send onboarding email
+
+```
+
+Or:
+
+```
+Payment successful
+      ↓
+Schedule invoice email
+      ↓
+Process later
+```
+
+We'll start with something much simpler
+
+---
+
+### Today's Goal
+
+We'll create:
+
+```
+POST /send-email
+```
+
+with an optional delay.
+
+For example:
+```
+{
+    "email": "test@gmail.com",
+    "delay": 10000
+}
+```
+
+10000 means:
+```
+10 sec
+```
+
+The API should respond immediately:
+```
+Job Added
+```
+
+But the worker should not process it immediately.
+
+---
+
+### 3. Important: No New Queue Needed
+
+We already have:
+
+```
+src/queues/email.queue.ts
+```
+
+We'll continue using it.
+
+Why?
+
+Because delayed jobs are a feature of a queue, not a different kind of queue.
+
+---
+
+### Step 1 — Open the Controller
+
+Open exactly:
+```
+background-job-system/
+└── src/
+    └── controllers/
+        └── email.controller.ts   <-- THIS FILE
+```
+
+We're going to modify it.
+
+---
+
+### Step 2 — Add `delay`
+
+Replace the complete file with:
+
+```
+import { Request, Response } from "express";
+import { emailQueue } from "../queues/email.queue";
+
+export async function sendEmail(
+    req: Request,
+    res: Response
+) {
+    const { email, delay = 0 } = req.body;
+
+    const job = await emailQueue.add(
+        "send-email",
+        {
+            email,
+        },
+        {
+            delay,
+        }
+    );
+
+    return res.status(200).json({
+        success: true,
+        message: "Job Added Successfully",
+        jobId: job.id,
+        delay,
+    });
+}
+```
+
+---
+
+### 3. Understand This Carefully
+
+This:
+```
+const { email, delay = 0 } = req.body;
+```
+
+means:
+if request is:
+
+```
+{
+    "email": "test@gmail.com"
+}
+```
+
+then:
+```
+delay=0;
+```
+
+So it behaves like a normal job.
+
+But if request is:
+
+```
+{
+    "email": "test@gmail.com",
+    "delay": 10000
+}
+```
+
+then:
+```
+delay=10000;
+```
+
+---
+
+### 4. The Important BullMQ Code
+
+This is the critical part:
+
+```
+await emailQueue.add(
+    "send-email",
+    {
+        email,
+    },
+    {
+        delay,
+    }
+);
+
+```
+
+The arguments are:
+```
+queue.add(
+
+    job name,
+
+    job data,
+
+    job options
+
+)
+```
+
+So:
+```
+"send-email"
+```
+
+is the job name.
+
+```
+{
+    email
+}
+```
+
+
+is the data.
+And:
+
+```
+{
+    delay
+}
+```
+
+is the configuration.
+
+---
+
+### Step 3 — Start Everything
+
+First:
+```
+docker compose up -d
+```
+
+Then Terminal 1:
+```
+npm run dev
+```
+
+Then Terminal 2:
+
+```
+npm run dev:worker
+```
+
+---
+
+### Step 4 — Test Normal Job
+
+Send:
+
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+```
+{
+    "email": "normal@gmail.com"
+}
+```
+
+Expected API response:
+```
+{
+    "success": true,
+    "message": "Job Added Successfully",
+    "jobId": "1",
+    "delay": 0
+}
+```
+
+The worker should process it immediately.
+
+---
+
+### Step 5 — Test Delayed Job
+
+Now send:
+
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+```
+{
+    "email": "delayed@gmail.com",
+    "delay": 10000
+}
+```
+
+Expected API response:
+
+```
+{
+    "success": true,
+    "message": "Job Added Successfully",
+    "jobId": "2",
+    "delay": 10000
+}
+```
+
+The API returns immediately.
+
+But look at the worker terminal.
+
+You should not immediately see:
+
+```
+Processing email job
+```
+
+Wait approximately:
+```
+10 seconds
+```
+
+Then:
+```
+Processing email job
+```
+
+and eventually:
+```
+Email processed successfully
+```
+
+---
+
+### Step 6 — Why Is This Powerful?
+
+Notice what happened.
+
+The API did:
+
+```
+POST /send-email
+
+      ↓
+
+emailQueue.add()
+
+      ↓
+
+Response immediately
+```
+
+It did `not` do:
+```
+wait 10 seconds
+```
+
+That's the entire point.
+
+The API is free to handle another request.
+
+---
+
+### Step 7 — Let's Observe Redis
+
+Open:
+```
+docker exec -it bg-redis redis-cli
+```
+
+Now create a delayed job:
+```
+{
+    "email": "redis-test@gmail.com",
+    "delay": 30000
+}
+```
+
+We used:
+```
+30000 ms
+```
+which is:
+```
+30 seconds
+```
+
+Immediately run:
+
+```
+KEYS bull:email-queue:*
+```
+
+You should see queue-related keys, potentially including a delayed-job structure depending on the BullMQ version.
+
+BullMQ manages the delayed state internally in Redis.
+
+---
+
+### Step 8 — Don't Manually Move the Job
+
+This is important.
+
+You should not write Redis code like:
+
+```
+redis.zadd(...)
+```
+
+to implement delayed jobs yourself.
+
+Don't do this:
+
+```
+API
+ ↓
+redis.zadd()
+ ↓
+custom scheduler
+ ↓
+worker
+```
+
+BullMQ already provides this functionality.
+
+We want:
+
+```
+API
+ ↓
+BullMQ
+ ↓
+Redis
+ ↓
+BullMQ Worker
+```
+
+Let the job system manage the lifecycle.
+
+---
+
+### Step 9 — Test Multiple Delayed Jobs
+
+Create three jobs.
+
+### Job 1
+```
+{
+    "email": "one@gmail.com",
+    "delay": 5000
+}
+```
+
+### Job 2 
+```
+{
+    "email": "two@gmail.com",
+    "delay": 10000
+}
+```
+
+### Job 3
+```
+{
+    "email": "two@gmail.com",
+    "delay": 10000
+}
+```
+
+You should observe roughly:
+
+```
+5 sec
+ ↓
+Job 1
+
+10 sec
+ ↓
+Job 2
+
+15 sec
+ ↓
+Job 3
+```
+
+The important thing is that the `delay belongs to each job.`
+
+---
+
+### Step 10 — Now Let's Make It Production-Safer
+
+Right now we're accepting:
+
+```
+{
+    "delay": -5000
+}
+```
+
+That's nonsense.
+
+Also:
+```
+{
+    "delay": "hello"
+}
+```
+
+is invalid.
+
+And:
+
+```
+{
+    "delay": 999999999999
+}
+```
+
+could be problematic.
+
+We shouldn't blindly trust request input.
+
+---
+
 
 
