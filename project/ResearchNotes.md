@@ -6991,5 +6991,1414 @@ We shouldn't blindly trust request input.
 
 ---
 
+### Step 11 — Validate Delay
+
+For now, let's keep the validation simple.
+
+Open:
+```
+src/controllers/email.controller.ts
+```
+
+Replace it with:
+```
+import { Request, Response } from "express";
+import { emailQueue } from "../queues/email.queue";
+
+export async function sendEmail(
+    req: Request,
+    res: Response
+) {
+    const { email, delay = 0 } = req.body;
+
+    if (typeof email !== "string" || email.trim() === "") {
+        return res.status(400).json({
+            success: false,
+            message: "Valid email is required",
+        });
+    }
+
+    if (
+        typeof delay !== "number" ||
+        !Number.isInteger(delay) ||
+        delay < 0
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Delay must be a positive integer",
+        });
+    }
+
+    const job = await emailQueue.add(
+        "send-email",
+        {
+            email,
+        },
+        {
+            delay,
+        }
+    );
+
+    return res.status(200).json({
+        success: true,
+        message: "Job Added Successfully",
+        jobId: job.id,
+        delay,
+    });
+}
+```
+
+---
+
+### Step 12 — Test Invalid Delay
+
+Send:
+
+```
+{
+    "email": "test@gmail.com",
+    "delay": -100
+}
+```
+
+
+### Step 12 — Test Invalid Delay
+Send:
+```
+{
+    "email": "test@gmail.com",
+    "delay": -100
+}
+```
+
+Expected:
+```
+{
+    "success": false,
+    "message": "Delay must be a positive integer"
+}
+```
+
+### Step 13 — Delay vs Retry
+
+This is one of the most important things to remember.
+
+### Delayed job
+
+You intentionally tell BullMQ:
+
+```
+Don't process this yet.
+```
+
+Example :
+```
+{
+    delay: 10000
+}
+```
+
+Meaning:
+```
+Wait 10 seconds
+```
+
+---
+
+#### Retry backoff
+
+The job already started and failed.
+
+```
+Worker
+ ↓
+Process
+ ↓
+FAIL
+ ↓
+Wait
+ ↓
+Retry
+```
+
+Controlled by:
+```
+backoff: {
+    type: "exponential",
+    delay: 1000
+}
+
+```
+
+---
+
+Visual Difference
+
+```
+DELAYED JOB
+
+API
+ │
+ ▼
+Redis
+ │
+ │ wait
+ │
+ │ 10 sec
+ ▼
+Worker
+ │
+ ▼
+Process
+```
+
+versus:
+
+```
+RETRY
+
+API
+ │
+ ▼
+Redis
+ │
+ ▼
+Worker
+ │
+ ▼
+Process
+ │
+ X
+FAIL
+ │
+ ▼
+Backoff
+ │
+ ▼
+Worker
+ │
+ ▼
+Process Again
+```
+
+Very different concepts.
+
+---
+
+### Step 14 — Production Scenario
+
+Imagine our application has password reset.
+
+User clicks:
+```
+Forgot Password
+```
+API
+```
+Generate reset token
+
+       ↓
+
+Save token in PostgreSQL
+
+       ↓
+
+Add email job
+
+       ↓
+
+Return response
+```
+
+Queue:
+```
+emailQueue.add(
+    "password-reset",
+    {
+        userId,
+        email,
+        resetToken
+    }
+)
+```
+Worker:
+```
+Receive job
+
+↓
+
+Generate email
+
+↓
+
+Send email
+
+↓
+
+Complete
+```
+
+That's where our project is heading.
+
+---
+
+### Step 15 — One Important Security Lesson
+
+Don't put sensitive information unnecessarily into Redis jobs.
+
+For example, don't casually put:
+
+```
+{
+    "password": "MySecretPassword"
+}
+```
+
+into a queue.
+
+Redis is infrastructure, not a secret vault.
+
+Prefer:
+```
+{
+    "userId": 123
+}
+```
+
+and let the worker retrieve what it legitimately needs.
+
+We'll discuss data ownership and security more deeply when we build the real email workflow.
+
+---
+
+### Current Architecture
+
+Your system is now:
+
+```
+                         ┌──────────────┐
+                         │    Client    │
+                         └──────┬───────┘
+                                │
+                                ▼
+                         ┌──────────────┐
+                         │  Express API │
+                         │   Producer   │
+                         └──────┬───────┘
+                                │
+                         queue.add()
+                                │
+                                ▼
+                  ┌─────────────────────────┐
+                  │          Redis          │
+                  │                         │
+                  │ WAITING                 │
+                  │ DELAYED                 │
+                  │ ACTIVE                  │
+                  │ COMPLETED               │
+                  │ FAILED                  │
+                  └────────────┬────────────┘
+                               │
+                               ▼
+                        ┌──────────────┐
+                        │    Worker    │
+                        │   Consumer   │
+                        └──────────────┘
+```
+
+We've now got:
+
+```
+✅ Queue
+
+✅ Worker
+
+✅ Successful jobs
+
+✅ Failed jobs
+
+✅ Retries
+
+✅ Exponential backoff
+
+✅ Delayed jobs
+```
+
+That's already a real asynchronous processing foundation.
+
+---
+
+### Module 1 — Lecture 6.7
+#### Job Priority
+
+Today we're going to make our queue smarter.
+
+Right now, suppose Redis contains:
+
+```
+100 normal jobs
+```
+
+and then a user requests:
+```
+Password Reset
+```
+
+We don't want important jobs to be treated exactly like low-value background work.
+
+We'll introduce `job priority.`
+
+
+---
+
+### 1. What We're Building
+
+Our queue will eventually handle:
+
+```
+HIGH PRIORITY
+────────────────
+Password reset
+Account security
+Payment confirmation
+
+NORMAL PRIORITY
+────────────────
+Welcome email
+Order confirmation
+
+LOW PRIORITY
+────────────────
+Analytics
+Reports
+Cleanup
+```
+
+The important concept is:
+
+ - Lower BullMQ priority number = higher priority.
+
+For example:
+```
+priority: 1   → very high
+priority: 5   → medium
+priority: 10  → low
+```
+
+---
+
+### 2. Important Limitation
+
+Priority does not mean:
+
+ - "This job will always execute immediately."
+
+If your worker is already processing a job:
+
+```
+Worker
+  │
+  ├── Processing normal job
+  │
+  │    ← High priority job arrives
+  │
+  └── Current job continues
+```
+
+The high-priority job cannot magically interrupt the currently executing JavaScript function.
+
+It will be considered when the worker is ready for another job.
+
+This is important for understanding real queue systems.
+
+---
+
+### 3. Today's Architecture
+
+We'll change:
+```
+POST /send-email
+
+        ↓
+
+emailQueue.add()
+
+        ↓
+
+Redis
+
+```
+
+into:
+```
+POST /send-email
+        │
+        ▼
+Determine priority
+        │
+        ▼
+BullMQ
+        │
+        ▼
+Redis
+        │
+        ▼
+Worker
+```
+
+---
+
+### Step 1 — Open the Controller
+
+Open exactly:
+
+```
+background-job-system/
+└── src/
+    └── controllers/
+        └── email.controller.ts
+```
+
+We currently accept:
+```
+{
+    "email": "test@gmail.com",
+    "delay": 10000
+}
+```
+We'll add:
+
+```
+{
+    "email": "test@gmail.com",
+    "priority": "high"
+}
+```
+
+---
+
+### Step 2 — Define Allowed Priorities
+
+At the top of:
+```
+src/controllers/email.controller.ts
+```
+add:
+```
+type EmailPriority = "high" | "normal" | "low";
+```
+
+So TypeScript knows that these are the only valid values.
+
+---
+
+### Step 3 — Create a Priority Map
+
+Below the type, add:
+
+```
+const PRIORITY_MAP: Record<EmailPriority, number> = {
+    high: 1,
+    normal: 5,
+    low: 10,
+};
+```
+
+This is important.
+
+Our API speaks in business terms:
+
+```
+high
+normal
+low
+```
+
+BullMQ receives:
+
+```
+1
+5
+10
+```
+
+So we're keeping BullMQ-specific infrastructure details out of the request.
+
+---
+
+Step 4 — Update the Complete Controller
+
+Open:
+```
+src/controllers/email.controller.ts
+```
+
+Replace the entire file with:
+
+```
+import { Request, Response } from "express";
+import { emailQueue } from "../queues/email.queue";
+
+type EmailPriority = "high" | "normal" | "low";
+
+const PRIORITY_MAP: Record<EmailPriority, number> = {
+    high: 1,
+    normal: 5,
+    low: 10,
+};
+
+export async function sendEmail(
+    req: Request,
+    res: Response
+) {
+    const {
+        email,
+        delay = 0,
+        priority = "normal",
+    } = req.body;
+
+    if (
+        typeof email !== "string" ||
+        email.trim() === ""
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Valid email is required",
+        });
+    }
+
+    if (
+        typeof delay !== "number" ||
+        !Number.isInteger(delay) ||
+        delay < 0
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Delay must be a positive integer",
+        });
+    }
+
+    if (
+        priority !== "high" &&
+        priority !== "normal" &&
+        priority !== "low"
+    ) {
+        return res.status(400).json({
+            success: false,
+            message:
+                "Priority must be high, normal, or low",
+        });
+    }
+
+    const job = await emailQueue.add(
+        "send-email",
+        {
+            email,
+        },
+        {
+            delay,
+            priority: PRIORITY_MAP[priority as EmailPriority],
+        }
+    );
+
+    return res.status(200).json({
+        success: true,
+        message: "Job Added Successfully",
+        jobId: job.id,
+        priority,
+        delay,
+    });
+}
+
+```
+
+---
+
+### Step 5 — Understand the Important Part
+
+This:
+```
+priority: PRIORITY_MAP[priority as EmailPriority]
+```
+
+could become:
+```
+high
+  ↓
+1
+
+normal
+  ↓
+5
+
+low
+  ↓
+10
+```
+
+So when the client sends:
+
+```
+{
+    "email": "user@gmail.com",
+    "priority": "high"
+}
+```
+
+BullMQ receives:
+```
+{
+    priority: 1
+}
+```
+
+---
+
+### Step 6 — Why Don't We Let Clients Send Numbers?
+
+We could do this:
+
+```
+{
+    "priority": 1
+}
+
+```
+
+But that's bad API design for our use case.
+
+What does:
+
+```
+priority: 1
+```
+
+mean?
+
+A developer has to know our infrastructure configuration.
+
+Instead:
+
+```
+{
+    "priority": "high"
+}
+```
+
+is self-explanatory.
+
+Our application owns the meaning.
+
+BullMQ owns the implementation.
+
+That's a good separation of concerns.
+
+---
+
+### Step 7 — Start Everything
+
+Start Redis:
+
+```
+docker compose up -d
+```
+
+Terminal 1
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+---
+
+### Step 8 — Test High Priority
+
+Send:
+
+```
+POST http://localhost:5000/send-email
+```
+
+Body:
+```
+{
+    "email": "important@gmail.com",
+    "priority": "high"
+}
+```
+
+Expected :
+```
+{
+    "success": true,
+    "message": "Job Added Successfully",
+    "jobId": "1",
+    "priority": "high",
+    "delay": 0
+}
+```
+
+The worker should process it.
+
+---
+
+### Step 9 — Test Normal Priority
+
+Send:
+
+```
+{
+    "email": "normal@gmail.com",
+    "priority": "normal"
+}
+```
+
+Expected:
+```
+{
+    "success": true,
+    "message": "Job Added Successfully",
+    "jobId": "2",
+    "priority": "normal",
+    "delay": 0
+}
+```
+
+---
+
+### Step 10 — Test Low Priority
+
+Send:
+
+```
+{
+    "email": "low@gmail.com",
+    "priority": "low"
+}
+```
+
+Expected:
+```
+{
+    "success": true,
+    "message": "Job Added Successfully",
+    "jobId": "3",
+    "priority": "low",
+    "delay": 0
+}
+```
+
+---
+
+### But We Haven't Proven Priority Yet
+
+Correct.
+
+If you send jobs one at a time:
+
+```
+Job 1
+ ↓
+Worker
+
+Job 2
+ ↓
+Worker
+
+Job 3
+ ↓
+Worker
+```
+
+there is no competition.
+
+We need to create a backlog.
+
+---
+
+### Step 11 — Make the Worker Slower
+
+This will allow us to observe scheduling.
+
+Open:
+
+```
+src/workers/email.worker.ts
+```
+
+Find:
+
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 2000);
+});
+```
+
+Change it temporarily to:
+
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 5000);
+});
+```
+
+Now each job takes approximately 5 seconds.
+
+---
+
+### Why Are We Doing This?
+
+We need enough time to create:
+
+```
+LOW
+LOW
+LOW
+HIGH
+```
+
+before the worker finishes the current job.
+
+---
+
+### Step 12 — Temporarily Stop the Worker
+
+In Terminal 2:
+```
+Ctrl + C
+```
+Now the queue has no consumer
+
+---
+
+### Step 13 — Add Low Priority Jobs
+
+Send these four requests.
+
+#### Job 1
+```
+{
+    "email": "low-1@gmail.com",
+    "priority": "low"
+}
+
+```
+
+### Job 2
+```
+{
+    "email": "low-2@gmail.com",
+    "priority": "low"
+}
+```
+
+### Job 3
+```
+{
+    "email": "low-3@gmail.com",
+    "priority": "low"
+}
+```
+
+Now add:
+
+Job 4
+
+```
+{
+    "email": "high-1@gmail.com",
+    "priority": "high"
+}
+
+```
+
+Now Redis contains roughly:
+
+```
+LOW
+LOW
+LOW
+HIGH
+```
+
+---
+
+Step 14 — Start Worker
+
+Run:
+
+```
+npm run dev:worker
+```
+
+Watch carefully.
+
+The worker should select the higher-priority eligible job before lower-priority waiting jobs.
+
+You should see:
+
+```
+high-1@gmail.com
+```
+
+being selected before the low-priority jobs.
+
+Then the low-priority jobs follow.
+
+---
+
+### Important Detail
+
+Don't be surprised if the exact logs don't look like:
+
+```
+HIGH
+LOW
+LOW
+LOW
+```
+
+because your previous jobs may still exist in Redis.
+
+You may also have:
+
+```
+completed
+failed
+delayed
+```
+
+jobs from previous lectures.
+
+For clean experiments, we should eventually give ourselves a proper queue reset/development cleanup mechanism.
+
+`Don't manually delete random Redis keys yet.`
+
+We'll build a safer queue-management approach later.
+
+---
+
+### Step 15 — Test Invalid Priority
+
+Send:
+```
+{
+    "email": "test@gmail.com",
+    "priority": "urgent"
+}
+```
+
+Expected:
+```
+{
+    "success": false,
+    "message": "Priority must be high, normal, or low"
+}
+```
+
+That's good.
+
+Our API doesn't allow arbitrary priority values.
+
+---
+
+### Step 16 — Test Default Priority
+
+Send:
+
+```
+{
+    "email": "default@gmail.com"
+}
+```
+
+Because we wrote:
+```
+priority = "normal"
+```
+
+the request becomes: 
+```
+priority = normal
+```
+
+and BullMQ gets:
+```
+priority = 5
+```
+
+---
+
+### Step 17 — Understand What BullMQ Is Doing
+
+Conceptually:
+
+```
+Redis Queue
+────────────────────────────
+
+Job A → priority 10
+Job B → priority 10
+Job C → priority 1
+Job D → priority 5
+
+                 │
+                 ▼
+
+             Worker
+
+                 │
+                 ▼
+
+             Job C
+```
+
+
+The worker doesn't simply say:
+
+ - "Give me the oldest job."
+
+It considers the queue's scheduling rules.
+
+
+---
+
+### Step 18 — Priority Is Not Preemption
+
+This is extremely important.
+
+Suppose:
+
+```
+Worker
+  │
+  ▼
+Processing LOW job
+```
+
+and then:
+```
+HIGH job arrives
+```
+
+BullMQ doesn't normally stop the low job halfway through.
+
+It does:
+```
+LOW
+│
+├── currently running
+│
+└── finishes
+       │
+       ▼
+HIGH
+```
+
+So priority affects `which waiting job is selected next.`
+
+It does not mean:
+
+```
+HIGH arrives
+   ↓
+kill LOW
+   ↓
+run HIGH
+```
+
+---
+
+### Step 19 — Priority + Concurrency
+
+Now think about this.
+
+One worker:
+
+```
+Worker concurrency = 1
+```
+
+means:
+```
+Job A
+  ↓
+finish
+  ↓
+Job B
+  ↓
+finish
+```
+
+If we later use:
+```
+concurrency: 5
+```
+
+the worker can process multiple jobs concurrently.
+
+Conceptually:
+
+```
+             Redis
+               │
+       ┌───────┼────────┐
+       ▼       ▼        ▼
+     Job 1   Job 2    Job 3
+       │       │        │
+       ▼       ▼        ▼
+    Worker  Worker   Worker
+      slot     slot     slot
+```
+
+We'll study concurrency separately because it has major implications for CPU, memory, external APIs, database connections, and rate limits.
+
+---
+
+### Step 20 — Why Priority Is Useful
+
+Imagine our application eventually has:
+
+```
+email-queue
+```
+with:
+```
+Password reset       HIGH
+OTP                  HIGH
+Order confirmation   HIGH
+
+Welcome email        NORMAL
+Newsletter           NORMAL
+
+Analytics report     LOW
+Cleanup              LOW
+```
+
+If the queue becomes busy:
+```
+10,000 analytics jobs
+```
+
+we don't necessarily want:
+```
+Password reset
+```
+
+waiting behind all of them.
+
+Priority gives us a scheduling mechanism.
+
+---
+
+### Step 21 — But Don't Abuse Priority
+
+A common mistake is:
+```
+Everything = HIGH
+```
+
+Then:
+```
+HIGH
+HIGH
+HIGH
+HIGH
+HIGH
+HIGH
+```
+
+If everything is important:
+
+ - Nothing is actually prioritized.
+
+Priority should represent a meaningful business requirement.
+
+---
+
+### Step 22 — One More Production Concern
+
+Imagine:
+```
+HIGH
+HIGH
+HIGH
+HIGH
+HIGH
+HIGH
+...
+```
+
+keeps arriving.
+
+Then:
+```
+LOW
+LOW
+LOW
+```
+
+may keep waiting.
+
+This is called `starvation.`
+
+So queue priority is not automatically a complete fairness strategy.
+
+Production systems sometimes need separate queues:
+
+```
+critical-queue
+normal-queue
+bulk-queue
+```
+
+or carefully designed worker allocation.
+
+We'll eventually compare:
+
+```
+One queue + priority
+```
+
+versus:
+```
+Multiple queues
+```
+
+because both are useful architectures.
+
+---
+
+### Step 23 — Restore Worker Delay
+
+We temporarily changed:
+
+```
+5000
+```
+
+Restore:
+```
+2000
+```
+
+Open:
+`src/workers/email.worker.ts`
+
+and make sure this is back to:
+
+```
+await new Promise((resolve) => {
+    setTimeout(resolve, 2000);
+});
+```
+
+Don't leave our artificial 5-second delay in the project.
+
+---
+
+### Current Architecture
+
+We now have:
+
+```
+                         Client
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │   Express   │
+                    │  Producer   │
+                    └──────┬──────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │   BullMQ    │
+                    │    Queue    │
+                    └──────┬──────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │    Redis    │
+                    │             │
+                    │  Delayed    │
+                    │  Waiting    │
+                    │  Active     │
+                    │  Completed  │
+                    │  Failed     │
+                    └──────┬──────┘
+                           │
+                           ▼
+                    ┌─────────────┐
+                    │   Worker    │
+                    │             │
+                    │ Priority    │
+                    │ Retry       │
+                    │ Backoff     │
+                    │ Delay       │
+                    └─────────────┘
+
+```
+
+---
+
+
+### Your Testing Checklist
+
+Do all five.
+
+#### Test 1 — High
+
+```
+{
+    "email": "high@gmail.com",
+    "priority": "high"
+}
+```
+
+#### Test 2 — Normal
+
+```
+{
+    "email": "normal@gmail.com",
+    "priority": "normal"
+}
+```
+
+#### Test 3 — Low
+```
+{
+    "email": "low@gmail.com",
+    "priority": "low"
+}
+
+```
+
+### Test 4 — Invalid
+```
+{
+    "email": "invalid@gmail.com",
+    "priority": "urgent"
+}
+```
+
+Expected:
+```
+400
+```
+
+Test 5 — Actual Priority Competition
+- Stop worker.
+- Add 3 low-priority jobs.
+- Add 1 high-priority job.
+- Start worker.
+- Observe which eligible job is selected first.
+
+---
+
+
 
 
