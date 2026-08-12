@@ -8399,6 +8399,833 @@ Test 5 — Actual Priority Competition
 
 ---
 
+### Next Lecture — Module 1, Lecture 6.8
+### Dead Letter Queue (DLQ)
+
+Until now, our system works like this:
+
+```
+API
+ │
+ ▼
+Main Queue
+ │
+ ▼
+Worker
+ │
+ ├── Success → Completed
+ │
+ └── Failure
+       │
+       ▼
+Retry
+       │
+       ▼
+Still Failed
+       │
+       ▼
+❌ Job Lost (Practically)
+```
+
+In a production system, `we never ignore permanently failed jobs.`
+
+Instead, we move them to a `Dead Letter Queue (DLQ).`
+
+```
+                Main Queue
+                    │
+                    ▼
+                 Worker
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+   Success                  Permanent Failure
+        │                       │
+        ▼                       ▼
+   Completed              Dead Letter Queue
+                                 │
+                                 ▼
+                     Developer / Admin Reviews
+```
+
+
+---
+
+### What is a Dead Letter Queue?
+
+A `Dead Letter Queue` is a special queue that stores jobs that `could not be processed successfully`, even after all retries.
+
+Examples:
+
+- Payment service permanently unavailable
+- Invalid email template
+- Corrupted image upload
+- Invalid webhook payload
+
+Instead of losing the job, we `preserve it.`
+
+---
+
+Today's Goal
+
+We'll build:
+
+- A dedicated DLQ
+- Automatically move failed jobs into it
+- Process DLQ jobs separately
+- Log why they failed
+- Keep original job information
+
+---
+
+### Project Structure After This Lecture
+
+```
+src/
+│
+├── queues/
+│   ├── email.queue.ts
+│   └── dead-letter.queue.ts   <-- NEW
+│
+├── workers/
+│   ├── email.worker.ts
+│   └── dlq.worker.ts          <-- NEW
+│
+├── worker.ts
+└── ...
+```
+
+---
+
+### Step 1 — Create the Dead Letter Queue
+### Create File
+`src/queues/dead-letter.queue.ts`
+
+Write:
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis";
+
+export const deadLetterQueue = new Queue("dead-letter-queue", {
+    connection: redis,
+
+    defaultJobOptions: {
+        attempts: 1,
+
+        removeOnComplete: false,
+
+        removeOnFail: false,
+    },
+});
+```
+
+---
+
+### Why attempts: 1 ?
+
+If a job has already failed permanently,
+
+we don't want another endless retry loop.
+
+```
+Main Queue
+↓
+
+Failed
+
+↓
+
+DLQ
+
+↓
+
+Store
+```
+
+Not:
+
+```
+DLQ
+
+↓
+
+Retry
+
+↓
+
+Retry
+
+↓
+
+Retry
+```
+
+---
+
+### Step 2 — Modify Email Worker
+
+Open
+`src/workers/email.worker.ts`
+
+---
+
+Find this listener:
+
+```
+emailWorker.on("failed", (job, error) => {
+
+    logger.error({
+        jobId: job?.id,
+        attemptsMade: job?.attemptsMade,
+        error: error.message,
+    }, "Job failed");
+
+});
+```
+
+Replace it with this complete version:
+```
+import { deadLetterQueue } from "../queues/dead-letter.queue";
+
+emailWorker.on("failed", async (job, error) => {
+
+    logger.error({
+        jobId: job?.id,
+        attemptsMade: job?.attemptsMade,
+        error: error.message,
+    }, "Job failed");
+
+    if (!job) {
+        return;
+    }
+
+    // Only move after ALL retries are exhausted
+    if (job.attemptsMade >= (job.opts.attempts ?? 1)) {
+
+        await deadLetterQueue.add(
+            "failed-email-job",
+            {
+                originalJobId: job.id,
+                email: job.data.email,
+                reason: error.message,
+                failedAt: new Date().toISOString(),
+            }
+        );
+
+        logger.warn({
+            originalJobId: job.id,
+        }, "Moved job to Dead Letter Queue");
+    }
+
+});
+```
+
+---
+
+### Why this condition?
+
+This line is extremely important.
+
+```
+if (job.attemptsMade >= (job.opts.attempts ?? 1))
+```
+
+Imagine:
+```
+attempts = 3
+```
+
+```
+Attempt 1
+
+↓
+
+Fail
+
+↓
+
+Retry
+
+Attempt 2
+
+↓
+
+Fail
+
+↓
+
+Retry
+
+Attempt 3
+
+↓
+
+Fail
+
+↓
+
+DLQ
+
+```
+
+We move the job `only after the final retry.`
+
+---
+
+### Step 3 — Create the DLQ Worker
+
+Create file
+`src/workers/dlq.worker.ts`
+Write:
+```
+import { Worker, Job } from "bullmq";
+import { redis } from "../config/redis";
+import { logger } from "../logger";
+
+interface DeadLetterJob {
+    originalJobId: string;
+    email: string;
+    reason: string;
+    failedAt: string;
+}
+
+new Worker<DeadLetterJob>(
+    "dead-letter-queue",
+
+    async (job: Job<DeadLetterJob>) => {
+
+        logger.warn({
+            originalJobId: job.data.originalJobId,
+            email: job.data.email,
+            reason: job.data.reason,
+            failedAt: job.data.failedAt,
+        }, "Dead Letter Job Received");
+
+        // In production this could:
+        // Save to DB
+        // Notify Slack
+        // Send PagerDuty alert
+        // Create Jira ticket
+    },
+
+    {
+        connection: redis,
+    }
+);
+
+logger.info("DLQ Worker Started");
+```
+
+---
+
+#### Step 4 — Start Both Workers
+
+Open
+`src/worker.ts`
+
+Currently you probably have:
+```
+import "./workers/email.worker";
+```
+
+Replace with:
+```
+import "./workers/email.worker";
+import "./workers/dlq.worker";
+```
+
+Now running:
+```
+npm run dev:worker
+```
+
+starts:
+```
+Email Worker
+
++
+
+DLQ Worker
+```
+
+---
+
+### Step 5 — Restart Everything
+
+Terminal 1
+
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+Expected:
+```
+Email worker started
+
+DLQ Worker Started
+```
+
+---
+
+### Step 6 — Force a Failure
+
+Use:
+
+```
+POST /send-email
+```
+Body
+```
+{
+    "email": "fail@gmail.com"
+}
+```
+
+Remember,
+
+our worker intentionally throws
+
+```
+throw new Error("Simulated email provider failure");
+```
+
+---
+
+### Step 7 — Observe
+
+Worker output
+```
+Attempt 1
+
+↓
+
+Fail
+
+↓
+
+Retry
+
+↓
+
+Attempt 2
+
+↓
+
+Fail
+
+↓
+
+Retry
+
+↓
+
+Attempt 3
+
+↓
+
+Fail
+
+↓
+
+Moved job to Dead Letter Queue
+
+↓
+
+DLQ Worker Received Job
+```
+
+Exactly what we wanted.
+
+---
+
+### Step 8 — What's Inside the DLQ?
+
+Our payload is
+
+```
+{
+    originalJobId: job.id,
+
+    email: job.data.email,
+
+    reason: error.message,
+
+    failedAt: new Date().toISOString()
+}
+```
+
+Notice
+
+We preserve
+
+ - Original Job ID
+ - Email
+ - Failure reason
+ - Failure timestamp
+
+That helps operators debug the issue later.
+
+---
+
+### Step 9 — Production Example
+
+Imagine
+
+```
+Payment Queue
+
+↓
+
+Stripe timeout
+
+↓
+
+Retry
+
+↓
+
+Retry
+
+↓
+
+Still failed
+
+↓
+
+DLQ
+```
+
+The DLQ might trigger
+
+```
+Slack alert
+
+↓
+
+Engineer notified
+
+↓
+
+Issue investigated
+
+↓
+
+Replay job
+```
+
+No payment request is silently lost.
+
+---
+
+### Step 10 — Test Another Failure
+
+Modify
+
+```
+if (job.data.email === "fail@gmail.com")
+```
+
+to
+
+```
+if (
+    job.data.email.includes("fail")
+)
+```
+
+Now these should fail
+
+```
+{
+    "email": "fail1@gmail.com"
+}
+
+```
+
+```
+{
+    "email": "fail2@gmail.com"
+}
+```
+
+```
+{
+    "email": "fail@gmail.com"
+}
+```
+Watch all of them appear in the DLQ.
+
+After testing, restore the original condition if you prefer.
+
+---
+
+### Step 11 — Why Not Delete Failed Jobs?
+
+Bad idea
+
+```
+Fail
+
+↓
+
+Delete
+```
+
+You've lost
+
+- Payload
+- Error
+- Context
+
+Impossible to investigate later.
+
+---
+
+Better
+```
+Fail
+
+↓
+
+DLQ
+
+↓
+
+Inspect
+
+↓
+
+Replay if needed
+```
+
+---
+
+### Step 12 — Redis Flow
+
+Now our architecture becomes
+
+```
+              API
+               │
+               ▼
+         Email Queue
+               │
+               ▼
+            Worker
+               │
+       ┌───────┴────────┐
+       ▼                ▼
+Completed           Failed
+                        │
+                        ▼
+              Dead Letter Queue
+                        │
+                        ▼
+                  DLQ Worker
+```
+
+
+---
+
+### Step 13 — A Better Design (Coming Soon)
+
+Right now,
+
+the DLQ worker only logs.
+
+Production systems usually do much more.
+
+For example
+
+```
+DLQ
+
+↓
+
+Database
+
+↓
+
+Admin Dashboard
+
+↓
+
+Replay Button
+
+↓
+
+Move back to Main Queue
+```
+
+We'll build that later.
+
+---
+
+### Step 14 — Verify in Redis
+
+Open
+```
+docker exec -it bg-redis redis-cli
+```
+
+
+Run:
+```
+KEYS bull:dead-letter-queue:*
+```
+
+You should now see Redis keys for the DLQ.
+
+---
+
+### Step 15 — One Important Production Rule
+
+#### Never put every failed job into the DLQ automatically without thinking.
+
+Some failures are `permanent:`
+
+```
+Email address doesn't exist
+```
+
+Retrying forever won't help.
+
+Others are `transient:`
+
+```
+SMTP server timeout
+```
+
+Retries make sense.
+
+Later in the course, we'll classify errors so we only retry when it is meaningful.
+
+---
+
+### Current Architecture
+```
+                    Client
+                      │
+                      ▼
+                Express API
+                      │
+                      ▼
+                 Email Queue
+                      │
+                      ▼
+                   Redis
+                      │
+                      ▼
+                 Email Worker
+                ┌─────┴─────┐
+                ▼           ▼
+          Completed     Failed
+                            │
+                            ▼
+                 Dead Letter Queue
+                            │
+                            ▼
+                     DLQ Worker
+```
+
+---
+
+### Testing Checklist
+#### Test 1 — Successful Job
+
+```
+{
+    "email": "success@gmail.com"
+}
+```
+
+Expected:
+```
+Completed
+
+NOT moved to DLQ
+```
+
+---
+
+Test 2 — Failed Job
+
+```
+{
+    "email": "fail@gmail.com"
+}
+```
+
+Expected:
+```
+Retry
+
+Retry
+
+Retry
+
+↓
+
+DLQ
+```
+
+---
+
+### Test 3 — Redis
+
+Run
+```
+docker exec -it bg-redis redis-cli
+```
+
+Then
+```
+KEYS bull:dead-letter-queue:*
+```
+
+Verify the DLQ exists.
+
+---
+
+### Test 4 — Worker Logs
+
+Verify you see
+
+```
+Moved job to Dead Letter Queue
+```
+and then
+```
+Dead Letter Job Received
+```
+
+---
+
+### What You've Learned
+
+You now understand:
+
+✅ Retries
+✅ Exponential backoff
+✅ Delayed jobs
+✅ Priorities
+✅ Permanent failures
+✅ Dead Letter Queue (DLQ)
+
+These are core building blocks used in production systems built with BullMQ, RabbitMQ, Kafka consumers, AWS SQS, Azure Service Bus, and Google Pub/Sub.
+
+---
+
+
+
+
+
+
 
 
 
