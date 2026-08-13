@@ -1,6 +1,7 @@
 import { Worker, Job } from "bullmq";
 import {redis} from "../config/redis.js"
 import { logger } from "../logger/index.js";
+import { deadLetterQueue } from "../queues/dead-letter.queue.js";
 
 interface EmailJobData{
     email:string;
@@ -42,12 +43,31 @@ emailWorker.on("completed", (job)=>{
     }, "Job completed")
 });
 
-emailWorker.on("failed", (job, error)=>{
+emailWorker.on("failed", async (job, error)=>{
     logger.error({
         jobId:job?.id,
          attemptsMade: job?.attemptsMade,
         error:error.message,
     }, "Job failed")
+
+    if(!job){
+        return;
+    }
+
+    if(job.attemptsMade >= (job.opts.attempts ?? 1)){
+        await deadLetterQueue.add(
+            "failed-email-job",
+            {
+              originalJobId: job.id,
+                email: job.data.email,
+                reason: error.message,
+                failedAt: new Date().toISOString(),
+            }
+        );
+         logger.warn({
+            originalJobId: job.id,
+        }, "Moved job to Dead Letter Queue");
+    }
 });
 
 
