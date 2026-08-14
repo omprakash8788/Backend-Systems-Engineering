@@ -4,6 +4,7 @@ import pinoHttp from "pino-http";
 import { logger } from "./logger/index.js";
 import { errorMiddleware } from "./middleware/error.middleware.js";
 import emailRoutes from "./routes/email.routes.js";
+import jobsRoutes from "./routes/jobs.routes.js"
 
 const app = express();
 
@@ -13,7 +14,11 @@ app.use(pinoHttp({logger}))
 
 app.use("/health", healthRoutes)
 
+
+
 app.use(emailRoutes);
+
+app.use("/api/v1/jobs", jobsRoutes);
 
 app.use((req, res) => {
   res.status(404).json({

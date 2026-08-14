@@ -9221,6 +9221,1396 @@ These are core building blocks used in production systems built with BullMQ, Rab
 
 ---
 
+### Module 1 — Lecture 6.9
+#### Production Job Monitoring & Administration API
+
+Up until now, we've been checking jobs using:
+```
+redis-cli
+```
+
+or watching the worker logs.
+
+That works for development, but in production, you don't SSH into Redis every time you want to inspect a job.
+
+Instead, you expose `internal/admin APIs.`
+
+By the end of this lecture, you'll have endpoints like:
+
+```
+GET    /api/v1/jobs/:id
+GET    /api/v1/jobs
+GET    /api/v1/jobs/failed
+GET    /api/v1/jobs/completed
+GET    /api/v1/jobs/waiting
+GET    /api/v1/jobs/delayed
+POST   /api/v1/jobs/:id/retry
+DELETE /api/v1/jobs/:id
+```
+
+---
+
+### What We'll Build
+
+```
+Admin Client
+      │
+      ▼
+Express API
+      │
+      ▼
+BullMQ Queue
+      │
+      ▼
+Redis
+```
+
+Instead of directly talking to Redis, our API will use `BullMQ's Queue API.`
+
+This is the production approach.
+
+---
+
+### Step 1 — Create a Jobs Controller
+
+Create this file:
+```
+background-job-system/
+└── src/
+    └── controllers/
+        └── jobs.controller.ts
+```
+
+Write:
+
+```
+import { Request, Response } from "express";
+import { emailQueue } from "../queues/email.queue";
+
+export async function getJob(
+    req: Request,
+    res: Response
+) {
+    const { id } = req.params;
+
+    const job = await emailQueue.getJob(id);
+
+    if (!job) {
+        return res.status(404).json({
+            success: false,
+            message: "Job not found",
+        });
+    }
+
+    return res.json({
+        success: true,
+        data: {
+            id: job.id,
+            name: job.name,
+            data: job.data,
+            attemptsMade: job.attemptsMade,
+            delay: job.opts.delay ?? 0,
+            priority: job.opts.priority ?? null,
+            timestamp: job.timestamp,
+        },
+    });
+}
+```
+
+---
+
+### Step 2 — Create Job Routes
+
+Create:
+```
+src/routes/jobs.routes.ts
+```
+
+Write:
+```
+import { Router } from "express";
+import { getJob } from "../controllers/jobs.controller";
+
+const router = Router();
+
+router.get("/:id", getJob);
+
+export default router;
+```
+
+---
+
+### Step 3 — Register Routes
+
+Open:
+```
+src/app.ts
+```
+
+Import:
+```
+import jobsRoutes from "./routes/jobs.routes";
+```
+
+Register it:
+```
+app.use("/api/v1/jobs", jobsRoutes);
+```
+
+Your routing should look similar to:
+
+```
+app.use("/api/v1", emailRoutes);
+
+app.use("/api/v1/jobs", jobsRoutes);
+```
+
+---
+
+### Step 4 — Restart
+
+API
+```
+npm run dev
+```
+
+Worker
+```
+npm run dev:worker
+```
+
+---
+
+### Step 5 — Create a Job
+```
+POST /api/v1/send-email
+```
+
+Body
+```
+{
+    "email": "john@gmail.com"
+}
+```
+
+Suppose response is
+```
+{
+    "success": true,
+    "jobId": "12"
+}
+```
+
+---
+
+### Step 6 — Query That Job
+
+Request
+```
+GET /api/v1/jobs/12
+```
+
+Example response 
+```
+{
+    "success": true,
+    "data": {
+        "id": "12",
+        "name": "send-email",
+        "data": {
+            "email": "john@gmail.com"
+        },
+        "attemptsMade": 0,
+        "delay": 0,
+        "priority": 5,
+        "timestamp": 1755120000000
+    }
+}
+```
+
+Now we can inspect jobs without Redis CLI.
+
+---
+
+### Step 7 — List Jobs by Status
+
+Open
+```
+src/controllers/jobs.controller.ts
+```
+
+Add:
+```
+export async function listJobs(
+    req: Request,
+    res: Response
+) {
+    const status =
+        (req.query.status as string) ?? "waiting";
+
+    const jobs = await emailQueue.getJobs([status as any]);
+
+    return res.json({
+        success: true,
+        count: jobs.length,
+        data: jobs.map((job) => ({
+            id: job.id,
+            name: job.name,
+            email: job.data.email,
+            attemptsMade: job.attemptsMade,
+        })),
+    });
+}
+```
+
+---
+
+### Step 8 — Update Routes
+
+Open
+
+```
+src/routes/jobs.routes.ts
+```
+
+Replace with:
+```
+import { Router } from "express";
+
+import {
+    getJob,
+    listJobs,
+} from "../controllers/jobs.controller";
+
+const router = Router();
+
+router.get("/", listJobs);
+
+router.get("/:id", getJob);
+
+export default router;
+```
+
+---
+
+### Step 9 — Test Waiting Jobs
+
+Request
+
+```
+GET /api/v1/jobs?status=waiting
+```
+
+Example
+```
+{
+    "success": true,
+    "count": 2,
+    "data": [
+        {
+            "id": "13",
+            "email": "one@gmail.com"
+        },
+        {
+            "id": "14",
+            "email": "two@gmail.com"
+        }
+    ]
+}
+```
+
+---
+
+### Step 10 — Other Statuses
+
+BullMQ supports several job states.
+
+Try:
+
+```
+GET /api/v1/jobs?status=completed
+```
+
+or
+```
+GET /api/v1/jobs?status=failed
+```
+
+or
+```
+GET /api/v1/jobs?status=delayed
+```
+
+or
+```
+GET /api/v1/jobs?status=active
+```
+
+or
+```
+GET /api/v1/jobs?status=waiting
+```
+
+---
+
+### Step 11 — Retry Failed Job
+
+BullMQ allows retrying a failed job.
+
+Add this to:
+
+```
+src/controllers/jobs.controller.ts
+```
+
+```
+export async function retryJob(
+    req: Request,
+    res: Response
+) {
+    const job = await emailQueue.getJob(req.params.id);
+
+    if (!job) {
+        return res.status(404).json({
+            success: false,
+            message: "Job not found",
+        });
+    }
+
+    await job.retry();
+
+    return res.json({
+        success: true,
+        message: "Retry requested",
+    });
+}
+```
+
+---
+
+### Step 12 — Register Route
+
+Open
+```
+src/routes/jobs.routes.ts
+```
+
+Add
+```
+import {
+    getJob,
+    listJobs,
+    retryJob,
+} from "../controllers/jobs.controller";
+```
+
+Then register
+```
+router.post("/:id/retry", retryJob);
+```
+
+Your routes should now be:
+
+```
+router.get("/", listJobs);
+
+router.get("/:id", getJob);
+
+router.post("/:id/retry", retryJob);
+```
+
+---
+
+### Step 13 — Delete Job
+
+Sometimes we want to remove an old completed or failed job.
+
+Add:
+```
+export async function deleteJob(
+    req: Request,
+    res: Response
+) {
+    const job = await emailQueue.getJob(req.params.id);
+
+    if (!job) {
+        return res.status(404).json({
+            success: false,
+            message: "Job not found",
+        });
+    }
+
+    await job.remove();
+
+    return res.json({
+        success: true,
+        message: "Job removed",
+    });
+}
+```
+
+---
+
+### Register Route
+```
+router.delete("/:id", deleteJob);
+```
+
+---
+
+### Final Route File
+```
+src/routes/jobs.routes.ts
+```
+
+```
+import { Router } from "express";
+
+import {
+    getJob,
+    listJobs,
+    retryJob,
+    deleteJob,
+} from "../controllers/jobs.controller";
+
+const router = Router();
+
+router.get("/", listJobs);
+
+router.get("/:id", getJob);
+
+router.post("/:id/retry", retryJob);
+
+router.delete("/:id", deleteJob);
+
+export default router;
+```
+
+---
+
+### Testing 
+
+### Test 1
+
+Create a job.
+```
+POST /api/v1/send-email
+```
+Save the `jobId.`
+
+---
+
+### Test 2
+
+Inspect it.
+```
+GET /api/v1/jobs/{jobId}
+```
+
+Expected:
+
+ - Correct job information.
+ - Payload is visible.
+
+---
+
+### Test 3
+
+Create a failing job.
+
+```
+{
+    "email": "fail@gmail.com"
+}
+```
+Wait until retries finish.
+
+Then
+```
+GET /api/v1/jobs?status=failed
+```
+
+Verify it appears.
+
+---
+
+### Test 4
+
+Retry it.
+
+```
+POST /api/v1/jobs/{jobId}/retry
+```
+Watch the worker logs.
+
+---
+
+### Test 5
+
+Delete a completed job.
+
+```
+DELETE /api/v1/jobs/{jobId}
+```
+
+Then
+```
+GET /api/v1/jobs/{jobId}
+```
+Expected"
+```
+{
+    "success": false,
+    "message": "Job not found"
+}
+```
+
+---
+
+### Production Notes
+
+The implementation above is intentionally simple for learning. In a production system, you should improve it by:
+
+- Validating status against an allowed list instead of using as any.
+- Protecting these endpoints with authentication and authorization (they should usually be admin-only).
+- Paginating results instead of returning every job.
+- Returning timestamps in ISO format for easier reading.
+- Logging all retry and delete operations for auditing.
+
+### Project Structure
+```
+src/
+│
+├── controllers/
+│   ├── email.controller.ts
+│   └── jobs.controller.ts
+│
+├── queues/
+│   ├── email.queue.ts
+│   └── dead-letter.queue.ts
+│
+├── routes/
+│   ├── email.routes.ts
+│   └── jobs.routes.ts
+│
+├── workers/
+│   ├── email.worker.ts
+│   └── dlq.worker.ts
+│
+├── app.ts
+├── server.ts
+└── worker.ts
+```
+
+---
+
+### What You Learned
+
+You can now:
+
+✅ Inspect a job by ID.
+✅ List jobs by status.
+✅ Retry failed jobs.
+✅ Delete jobs.
+✅ Build admin APIs on top of BullMQ instead of relying on redis-cli.
+
+These are the kinds of APIs that power internal operations dashboards.
+
+---
+
+### Module 1 — Lecture 6.10
+#### Job Progress Tracking (Production Grade)
+
+Until now, our jobs have only two visible states:
+
+```
+Waiting
+    ↓
+Running
+    ↓
+Completed
+```
+
+But in real production systems, a job may run for several minutes.
+
+Think about:
+
+- Uploading a 5 GB video
+- Processing 10,000 images
+- Exporting 1 million database rows
+- Sending 100,000 emails
+
+If the frontend only knows:
+
+```
+Running...
+```
+
+that's a terrible user experience.
+
+Instead, production systems expose `progress.`
+
+```
+0%
+ │
+ ▼
+20%
+ │
+ ▼
+45%
+ │
+ ▼
+80%
+ │
+ ▼
+100%
+```
+
+BullMQ provides this feature out of the box.
+
+---
+
+### Today's Goal
+
+We'll build:
+
+```
+Worker
+    │
+    ▼
+job.updateProgress(...)
+    │
+    ▼
+Redis
+    │
+    ▼
+REST API
+    │
+    ▼
+Frontend
+```
+
+---
+
+### What We'll Build
+
+Our email worker will simulate multiple steps.
+
+```
+Receive Job
+      │
+      ▼
+10% Validate Request
+      │
+      ▼
+30% Load Email Template
+      │
+      ▼
+60% Generate HTML
+      │
+      ▼
+80% Send Email
+      │
+      ▼
+100% Done
+```
+
+---
+
+### Step 1 — Open Worker
+
+Open
+```
+src/workers/email.worker.ts
+```
+Find your processor.
+
+It currently looks similar to:
+```
+async (job) => {
+
+    logger.info({
+        jobId: job.id,
+    }, "Processing");
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+}
+```
+
+We're replacing only the processing logic.
+
+---
+
+### Step 2 — Update Progress
+
+Replace the processing part with:
+
+```
+logger.info(
+    {
+        jobId: job.id,
+    },
+    "Processing email job"
+);
+
+// STEP 1
+await job.updateProgress(10);
+
+await new Promise((resolve) => {
+    setTimeout(resolve, 1000);
+});
+
+// STEP 2
+await job.updateProgress(30);
+
+await new Promise((resolve) => {
+    setTimeout(resolve, 1000);
+});
+
+// STEP 3
+await job.updateProgress(60);
+
+await new Promise((resolve) => {
+    setTimeout(resolve, 1000);
+});
+
+// STEP 4
+await job.updateProgress(80);
+
+await new Promise((resolve) => {
+    setTimeout(resolve, 1000);
+});
+
+// Finished
+await job.updateProgress(100);
+
+logger.info(
+    {
+        jobId: job.id,
+    },
+    "Email processed successfully"
+);
+```
+
+---
+
+### What Does updateProgress() Do?
+
+This line
+```
+await job.updateProgress(60);
+```
+
+writes progress into Redis.
+
+BullMQ stores it automatically.
+
+You don't have to create another Redis key.
+
+---
+
+### Step 3 — Expose Progress
+
+Open
+
+```
+src/controllers/jobs.controller.ts
+```
+
+Find
+```
+getJob()
+```
+
+Currently you return something similar to:
+```
+data: {
+    id: job.id,
+    name: job.name,
+    data: job.data,
+}
+```
+Add
+```
+progress: job.progress,
+```
+
+The complete return becomes
+```
+return res.json({
+    success: true,
+
+    data: {
+        id: job.id,
+        name: job.name,
+        data: job.data,
+        attemptsMade: job.attemptsMade,
+        progress: job.progress,
+        delay: job.opts.delay ?? 0,
+        priority: job.opts.priority ?? null,
+        timestamp: job.timestamp,
+    },
+});
+```
+
+---
+
+### Step 4 — Restart
+
+Terminal 1
+
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+---
+
+### Step 5 — Create a Job
+
+Request
+
+```
+POST /api/v1/send-email
+```
+Body
+```
+{
+    "email": "progress@gmail.com"
+}
+```
+Suppose response
+```
+{
+    "jobId": "45"
+}
+```
+
+---
+
+### Step 6 — Poll Progress
+
+Immediately request
+
+```
+GET /api/v1/jobs/45
+```
+
+Depending on timing you may see
+
+```
+{
+    "progress": 10
+}
+```
+
+One second later
+```
+{
+    "progress": 30
+}
+```
+
+Again
+```
+{
+    "progress": 60
+}
+```
+
+Later 
+```
+{
+    "progress": 80
+}
+
+```
+
+Finally
+```
+{
+    "progress": 100
+}
+```
+
+---
+
+### Visual Timeline
+```
+Client
+
+↓
+
+POST /send-email
+
+↓
+
+Job Created
+
+↓
+
+GET /jobs/45
+
+↓
+
+10%
+
+↓
+
+GET /jobs/45
+
+↓
+
+30%
+
+↓
+
+GET /jobs/45
+
+↓
+
+60%
+
+↓
+
+GET /jobs/45
+
+↓
+
+80%
+
+↓
+
+GET /jobs/45
+
+↓
+
+100%
+```
+
+---
+
+### Step 7 — Improve Progress
+
+Numbers alone aren't very helpful.
+
+Instead of only
+
+```
+60
+```
+BullMQ lets us store an object.
+Replace 
+```
+await job.updateProgress(60);
+```
+
+With
+
+```
+await job.updateProgress({
+    percentage: 60,
+    step: "Generating HTML",
+});
+```
+
+Now every update becomes
+
+```
+await job.updateProgress({
+    percentage: 10,
+    step: "Validating request",
+});
+
+await job.updateProgress({
+    percentage: 30,
+    step: "Loading template",
+});
+
+await job.updateProgress({
+    percentage: 60,
+    step: "Generating HTML",
+});
+
+await job.updateProgress({
+    percentage: 80,
+    step: "Sending email",
+});
+
+await job.updateProgress({
+    percentage: 100,
+    step: "Completed",
+});
+```
+
+---
+
+### Step 8 — No Controller Changes Needed
+
+Because
+
+```
+job.progress
+```
+
+returns whatever we stored.
+
+Now the API returns
+
+```
+{
+    "progress": {
+        "percentage": 60,
+        "step": "Generating HTML"
+    }
+}
+```
+
+Much better 
+
+---
+
+### Step 9 — Production Example
+
+Imagine
+
+```
+Video Upload
+```
+
+Progress might look like
+```
+{
+    "percentage": 10,
+    "step": "Uploading"
+}
+```
+
+then
+
+```
+{
+    "percentage": 35,
+    "step": "Extracting Audio"
+}
+```
+
+then
+
+```
+{
+    "percentage": 55,
+    "step": "Generating Thumbnail"
+}
+```
+
+then
+
+```
+{
+    "percentage": 80,
+    "step": "Encoding Video"
+}
+```
+
+then
+
+```
+{
+    "percentage": 100,
+    "step": "Finished"
+}
+```
+
+Exactly the same mechanism.
+
+---
+
+### Step 10 — Frontend Polling
+
+A frontend could do
+
+```
+Every 2 seconds
+
+↓
+
+GET /jobs/:id
+
+↓
+
+Read progress
+
+↓
+
+Update progress bar
+```
+
+Like
+
+```
+██████░░░░░
+
+60%
+```
+
+---
+
+### Step 11 — Important
+
+Progress is not persisted forever.
+
+Remember
+
+```
+removeOnComplete: 100
+```
+
+Eventually BullMQ removes old jobs.
+
+Once removed,
+
+```
+GET /jobs/:id
+```
+
+returns
+
+```
+404
+```
+
+That's expected.
+
+If your business requires permanent audit history, save it in PostgreSQL, not only in BullMQ.
+
+---
+
+### Step 12 — Better Architecture
+
+For long-running jobs:
+
+```
+Worker
+
+↓
+
+Progress
+
+↓
+
+Redis
+
+↓
+
+REST API
+
+↓
+
+Frontend
+```
+
+For real-time updates:
+
+```
+Worker
+
+↓
+
+Redis
+
+↓
+
+WebSocket
+
+↓
+
+Frontend
+```
+
+Polling is simple.
+
+WebSockets are more efficient.
+
+We'll cover WebSockets in a later module.
+
+---
+
+### Step 13 — Add a Dedicated Progress Endpoint
+
+Instead of returning the whole job every time, let's expose only progress.
+
+Open
+```
+src/controllers/jobs.controller.ts
+```
+
+Add:
+```
+export async function getJobProgress(
+    req: Request,
+    res: Response
+) {
+    const job = await emailQueue.getJob(req.params.id);
+
+    if (!job) {
+        return res.status(404).json({
+            success: false,
+            message: "Job not found",
+        });
+    }
+
+    return res.json({
+        success: true,
+        progress: job.progress,
+    });
+}
+```
+
+---
+
+### Step 14 — Register Route
+
+Open
+
+```
+src/routes/jobs.routes.ts
+```
+
+Import 
+```
+getJobProgress
+```
+
+Then add 
+```
+router.get("/:id/progress", getJobProgress);
+```
+
+Your routes become
+
+```
+router.get("/", listJobs);
+
+router.get("/:id", getJob);
+
+router.get("/:id/progress", getJobProgress);
+
+router.post("/:id/retry", retryJob);
+
+router.delete("/:id", deleteJob);
+```
+
+---
+
+### Testing
+Test 1
+
+Create a job.
+```
+POST /api/v1/send-email
+```
+
+---
+
+Test 2
+
+Immediately call
+```
+GET /api/v1/jobs/{id}/progress
+```
+Expected 
+```
+{
+    "progress": {
+        "percentage": 10,
+        "step": "Validating request"
+    }
+}
+```
+
+---
+
+Test 3
+
+Wait one second
+
+```
+GET /api/v1/jobs/{id}/progress
+```
+Expected
+```
+{
+    "progress": {
+        "percentage": 30,
+        "step": "Loading template"
+    }
+}
+```
+
+---
+
+Test 4
+
+Continue polling until
+
+```
+{
+    "progress": {
+        "percentage": 100,
+        "step": "Completed"
+    }
+}
+```
+
+---
+
+### Production Notes
+
+For production systems:
+
+✅ Store progress as an object, not just a number.
+
+✅ Keep progress updates meaningful (avoid updating every millisecond).
+
+✅ Use WebSockets or Server-Sent Events (SSE) for live updates instead of aggressive polling.
+
+✅ Persist important business status in your database if users need to view historical progress after BullMQ removes completed jobs.
+
+---
+
+### What You Learned
+
+You now know how to:
+
+✅ Update job progress from a worker.
+✅ Store progress in Redis via BullMQ.
+✅ Expose progress through REST APIs.
+✅ Design progress data for frontend consumption.
+✅ Understand the difference between temporary queue state and permanent business state.
+
+At this point, your queue system supports:
+
+- Producers
+- Workers
+- Retries
+- Backoff
+- Delayed jobs
+- Priorities
+- Dead Letter Queue
+- Job Monitoring APIs
+- Progress Tracking
+
+This is already approaching the feature set of many real-world background processing systems.
+
+---
+
+
 
 
 
