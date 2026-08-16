@@ -1,6 +1,7 @@
 import { Request, Response } from "express"
 
 import { emailQueue } from "../queues/email.queue.js"
+import { logger } from "../logger/index.js";
 
 type EmailPriority = "high" | "normal" | "low";
 
@@ -49,11 +50,15 @@ export async function sendEmail(req: Request, res: Response) {
         email
     },
         {
+            jobId:email,
             delay,
             priority:PRIORITY_MAP[priority as EmailPriority],
         }
 
+    
     );
+
+    //  logger.info({ email }, "Adding job");
 
 
     return res.status(200).json({

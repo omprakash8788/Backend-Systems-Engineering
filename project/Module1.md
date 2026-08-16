@@ -10610,12 +10610,3169 @@ This is already approaching the feature set of many real-world background proces
 
 ---
 
+### Module 1 — Lecture 6.12
+### Graceful Shutdown & Zero Job Loss (Production Grade)
+
+This lecture is one of the most important for production deployments.
+
+Imagine your application is running in:
+
+- Docker
+- Kubernetes
+- PM2
+- AWS ECS
+- Railway
+- Render
+
+When you deploy a new version, your worker doesn't just disappear.
+
+The operating system sends a signal:
+
+```
+SIGTERM
+```
+or
+```
+SIGINT
+```
+
+If your worker exits immediately:
+
+```
+Worker
+   │
+Processing Job
+   │
+SIGTERM
+   │
+❌ Process exits
+```
+
+The current job may never finish.
+
+In the worst case:
+
+- Customer receives duplicate emails.
+- Payment processing is interrupted.
+- Data becomes inconsistent.
+
+A production worker must shut down gracefully.
+
+---
+
+### Today's Goal
+
+Instead of:
+
+```
+SIGTERM
+   │
+Exit Immediately ❌
+```
+
+We'll implement:
+```
+SIGTERM
+   │
+Stop accepting new jobs
+   │
+Finish running jobs
+   │
+Close Redis connections
+   │
+Exit safely ✅
+```
+
+---
+
+### Step 1 — Open Worker Entry File
+
+Open:
+
+```
+background-job-system/
+└── src/
+    └── worker.ts
+```
+
+Currently it probably contains:
+```
+import "./workers/email.worker";
+import "./workers/dlq.worker";
+```
+We'll improve it.
+
+---
+
+Step 2 — Export Workers
+
+Open:
+```
+src/workers/email.worker.ts
+```
+
+Make sure your worker is exported.
+
+Instead of:
+```
+new Worker(...)
+```
+
+Change it to:
+```
+export const emailWorker = new Worker(
+    "email-queue",
+    async (job) => {
+
+        // existing processing logic
+
+    },
+    {
+        connection: redis,
+        concurrency: 5,
+    }
+);
+```
+
+---
+
+Do the same for:
+```
+src/workers/dlq.worker.ts
+```
+
+Replace 
+```
+new Worker(...)
+```
+
+with
+```
+export const dlqWorker = new Worker(
+    "dead-letter-queue",
+    async (job) => {
+
+        // existing logic
+
+    },
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 3 — Update worker.ts
+
+Replace the file completely.
+
+```
+src/worker.ts
+```
+
+```
+import { logger } from "./logger";
+import { emailWorker } from "./workers/email.worker";
+import { dlqWorker } from "./workers/dlq.worker";
+
+logger.info("Workers started");
+
+async function shutdown(signal: string) {
+    logger.warn({ signal }, "Shutdown signal received");
+
+    logger.info("Closing Email Worker...");
+    await emailWorker.close();
+
+    logger.info("Closing DLQ Worker...");
+    await dlqWorker.close();
+
+    logger.info("All workers closed");
+
+    process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+```
+
+---
+
+### What Does worker.close() Do?
+
+This is the important part.
+
+It `does not` kill the current job.
+
+Instead:
+
+```
+Running Job
+
+↓
+
+Finish Current Job
+
+↓
+
+Don't pick another job
+
+↓
+
+Close Redis
+
+↓
+
+Exit
+```
+
+Exactly what we want.
+
+---
+
+### Step 4 — Improve Logging
+
+Inside
+
+```
+src/workers/email.worker.ts
+```
+
+Add:
+```
+emailWorker.on("completed", (job) => {
+
+    logger.info({
+        jobId: job.id,
+    }, "Job completed");
+
+});
+```
+
+Now we'll clearly see whether the running job finishes before shutdown.
+
+---
+
+### Step 5 — Simulate Long Processing
+
+Temporarily make every job take longer.
+
+```
+await new Promise(resolve =>
+    setTimeout(resolve, 10000)
+);
+```
+
+Ten seconds 
+
+---
+
+### Step 6 — Restart
+
+Terminal 1
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+---
+
+### Step 7 — Create a Job
+```
+POST /api/v1/send-email
+```
+
+Body 
+```
+{
+    "email": "shutdown@test.com"
+}
+```
+Worker begins processing.
+
+---
+
+### Step 8 — Stop the Worker
+
+While it's processing:
+```
+CTRL + C
+```
+
+Instead of exiting instantly, you should see something similar to:
+
+```
+Started processing
+
+Shutdown signal received
+
+Closing Email Worker...
+
+Finished processing
+
+Job completed
+
+Closing DLQ Worker...
+
+All workers closed
+```
+
+Notice:
+
+The worker `finished` the active job before shutting down.
+
+---
+
+### What Happens Without Graceful Shutdown?
+
+Imagine:
+```
+Worker
+
+↓
+
+Send Email
+
+↓
+
+Process Killed
+
+↓
+
+Redis still thinks job failed
+
+↓
+
+Retry
+
+↓
+
+Customer receives duplicate email
+```
+
+Production bug.
+
+---
+
+### Step 9 — Close Queue Connections
+
+Open:
+
+```
+src/server.ts
+```
+
+Suppose your server currently ends like:
+
+```
+app.listen(PORT, () => {
+
+    logger.info("Server started");
+
+});
+```
+
+Replace with:
+
+```
+const server = app.listen(PORT, () => {
+    logger.info(`Server started on ${PORT}`);
+});
+
+async function shutdown(signal: string) {
+
+    logger.warn({ signal }, "API shutting down");
+
+    server.close(() => {
+        logger.info("HTTP server closed");
+    });
+
+    process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+```
+
+---
+
+### Why Close the HTTP Server?
+
+Without it:
+
+```
+Deployment
+
+↓
+
+Old server still accepts requests
+
+↓
+
+Worker already stopping
+
+↓
+
+New jobs arrive
+
+↓
+
+Unexpected behavior
+```
+
+Instead:
+
+```
+Stop HTTP
+
+↓
+
+Finish active requests
+
+↓
+
+Exit
+```
+
+---
+
+### Step 10 — Real Kubernetes Deployment
+
+Kubernetes sends:
+
+```
+SIGTERM
+```
+
+Then waits 
+```
+Pod
+
+↓
+
+SIGTERM
+
+↓
+
+Graceful Shutdown
+
+↓
+
+Pod Deleted
+```
+
+If your worker ignores SIGTERM:
+
+```
+SIGTERM
+
+↓
+
+Killed
+
+↓
+
+Jobs interrupted
+```
+
+---
+
+### Step 11 — PM2
+
+PM2 behaves similarly.
+
+```
+pm2 restart app
+```
+
+PM2 sends:
+```
+SIGINT
+```
+Your shutdown handler runs automatically.
+
+---
+
+### Step 12 — Docker
+
+Docker also sends
+
+```
+SIGTERM
+```
+
+before stopping a container.
+
+That means the same shutdown code works for:
+
+- Docker
+- Kubernetes
+- PM2
+- ECS
+
+One implementation covers many deployment platforms.
+
+---
+
+### Testing
+#### Test 1 — Long Job
+
+Set:
+
+```
+setTimeout(resolve, 10000);
+```
+
+Submit a job.
+
+Press
+```
+CTRL + C
+```
+
+Expected:
+
+The worker waits for the current job to finish before exiting.
+
+---
+
+### Test 2 — Queue Multiple Jobs
+
+Create five jobs.
+
+While the first is processing:
+
+```
+CTRL + C
+```
+
+Expected:
+
+- Current job completes.
+- Remaining jobs stay in Redis.
+- After restarting the worker, the remaining jobs continue processing.
+
+---
+
+### Test 3 — Restart Worker
+
+Run:
+```
+npm run dev:worker
+```
+
+Verify waiting jobs are picked up automatically.
+
+---
+
+### Production Notes
+
+A production worker should always:
+
+- Handle SIGINT and SIGTERM.
+- Stop accepting new jobs.
+- Finish active jobs.
+- Close Redis connections.
+- Exit with status code 0 after successful cleanup.
+
+Avoid using `process.exit()` before cleanup has finished.
+
+---
+
+### Project Structure
+
+```
+src/
+├── server.ts
+├── worker.ts
+├── workers/
+│   ├── email.worker.ts
+│   └── dlq.worker.ts
+├── queues/
+├── controllers/
+├── routes/
+└── config/
+```
+
+---
+
+### What You Learned
+
+You now know how to:
+
+✅ Handle shutdown signals.
+✅ Prevent job interruption during deployments.
+✅ Close workers cleanly.
+✅ Stop HTTP traffic safely.
+✅ Prepare your worker for Docker, PM2, and Kubernetes.
+
+Your background processing system now includes:
+
+- Express Producer
+- Redis
+- BullMQ
+- Retries
+- Exponential Backoff
+- Delayed Jobs
+- Priorities
+- Dead Letter Queue
+- Monitoring APIs
+- Progress Tracking
+- Worker Concurrency
+- Graceful Shutdown
+
+This is a solid production-grade foundation.
+
+---
+
+
+### Module 1 — Lecture 6.13
+### Idempotent Job Processing (Production Grade)
+
+Module 1 — Lecture 6.13
+Idempotent Job Processing (Production Grade)
+
+- "Retries are safe."
+
+They are `not` safe unless your jobs are `idempotent`.
+
+By the end of this lecture, you'll understand why companies like Stripe, PayPal, AWS, and Shopify invest heavily in idempotency.
+
+---
+
+The Problem
+
+Imagine a user clicks:
+
+```
+Pay ₹1000
+```
+
+Your API adds a job:
+
+```
+Job #101
+```
+
+Worker:
+```
+Charge Card
+```
+
+Stripe successfully charges the customer.
+
+But just before the worker reports success...
+
+```
+💥 Worker crashes
+```
+
+BullMQ thinks:
+```
+Job Failed
+```
+So it retries.
+
+Now:
+```
+Charge Card Again
+```
+
+Customer is charged `twice.`
+
+This is called `duplicate processing`
+
+---
+
+### What is Idempotency?
+
+An operation is `idempotent` if running it multiple times produces the `same final result.`
+
+Example:
+```
+Set user status = ACTIVE
+```
+
+Run once 
+```
+ACTIVE
+```
+
+Run ten times:
+```
+ACTIVE
+```
+
+No problem.
+
+---
+
+Non-idempotent example:
+```
+Balance += ₹100
+```
+
+Run once:
+```
+₹100
+```
+
+Run twice:
+```
+₹200
+```
+
+Wrong.
+
+---
+
+### Queue Retry vs Business Operation
+
+BullMQ guarantees:
+
+```
+Job Delivery
+```
+
+It `does not` guarantee:
+
+```
+Business Safety
+```
+
+That is `our responsibility.`
+
+---
+
+### Today's Goal
+
+We'll prevent duplicate email processing.
+
+Current flow:
+
+```
+API
+
+↓
+
+Queue
+
+↓
+
+Worker
+
+↓
+
+Send Email
+```
+
+New flow:
+
+```
+API
+
+↓
+
+Unique Job ID
+
+↓
+
+Queue
+
+↓
+
+Worker
+
+↓
+
+Already Processed?
+
+↓
+
+YES → Skip
+
+↓
+
+NO → Process
+```
+
+---
+
+### Strategy 1 — BullMQ Job IDs
+
+BullMQ lets us assign our own job IDs.
+
+If the same job ID already exists,
+
+BullMQ won't create another waiting job.
+
+This is the first layer of protection.
+
+---
+
+### Step 1 — Open Email Controller
+
+Open:
+
+```
+src/controllers/email.controller.ts
+```
+
+Find:
+```
+const job = await emailQueue.add(
+    "send-email",
+    {
+        email,
+    },
+    {
+        delay,
+        priority: PRIORITY_MAP[priority],
+    }
+);
+```
+
+Replace with:
+```
+const job = await emailQueue.add(
+    "send-email",
+    {
+        email,
+    },
+    {
+        jobId: email,
+        delay,
+        priority: PRIORITY_MAP[priority],
+    }
+);
+```
+
+---
+
+### Why?
+
+Instead of BullMQ generating
+
+```
+1
+2
+3
+4
+```
+
+our IDs become
+
+```
+alice@gmail.com
+```
+or
+```
+bob@gmail.com
+```
+
+The queue now treats the email address as the unique identifier.
+
+---
+
+### Step 2 — Restart
+
+```
+npm run dev
+```
+Worker:
+```
+npm run dev:worker
+```
+
+---
+
+### Step 3 — Test Duplicate Requests
+
+Send twice:
+
+```
+POST /api/v1/send-email
+```
+
+Body:
+```
+{
+    "email": "alice@gmail.com"
+}
+```
+
+Immediately send it again.
+
+BullMQ will `not` create another waiting job with the same jobId while the existing one is still present.
+
+---
+
+### Important Limitation
+
+Using:
+
+```
+jobId: email
+```
+is only for learning.
+
+Imagine:
+```
+alice@gmail.com
+```
+
+receives
+
+- Welcome Email
+- Invoice
+- Password Reset
+
+All three would have the same job ID.
+
+Bad idea.
+
+Instead we need something more specific.
+
+---
+
+### Better Job IDs
+
+Example:
+```
+jobId: `welcome:${email}`
+```
+
+or
+```
+jobId: `reset-password:${userId}:${token}`
+```
+
+or
+```
+jobId: orderId
+```
+
+Choose an identifier that represents `one unique business operation.`
+
+---
+
+### Strategy 2 — Processed Records
+
+Even if BullMQ retries,
+
+our worker should know whether the work has already been completed.
+
+For learning, we'll use an in-memory `Set.`
+
+Later we'll replace it with PostgreSQL.
+
+---
+
+### Step 4 — Create a Store
+
+Create:
+```
+src/utils/processed-jobs.ts
+```
+
+```
+export const processedEmails = new Set<string>();
+```
+
+---
+
+### Step 5 — Update Worker
+
+Open:
+
+```
+src/workers/email.worker.ts
+```
+Import:
+```
+import { processedEmails } from "../utils/processed-jobs";
+```
+
+---
+
+Before your processing logic, add:
+
+```
+if (processedEmails.has(job.data.email)) {
+
+    logger.warn(
+        {
+            email: job.data.email,
+        },
+        "Duplicate job skipped"
+    );
+
+    return;
+}
+```
+
+---
+
+After successful processing, add:
+```
+processedEmails.add(job.data.email);
+```
+
+Complete flow:
+```
+Receive Job
+
+↓
+
+Already Processed?
+
+↓
+
+YES
+
+↓
+
+Skip
+
+↓
+
+NO
+
+↓
+
+Send Email
+
+↓
+
+Mark Processed
+```
+
+---
+
+### Step 6 — Test
+
+Submit:
+```
+{
+    "email": "duplicate@gmail.com"
+}
+```
+
+Then retry the same job manually.
+
+Expected log:
+```
+Duplicate job skipped
+```
+
+---
+
+### Why This Isn't Production Ready
+
+Our Set lives only in RAM.
+
+If the worker restarts:
+
+```
+processedEmails
+
+↓
+
+Lost
+```
+
+All history disappears
+
+---
+
+### Production Solution
+
+Instead of memory:
+
+```
+Redis
+
+or
+
+PostgreSQL
+```
+
+Example:
+```
+processed_jobs
+
+-----------------------------
+
+operation_id
+
+processed_at
+
+```
+
+Worker:
+
+```
+SELECT operation_id
+
+↓
+
+Exists?
+
+↓
+
+YES
+
+↓
+
+Skip
+
+↓
+
+NO
+
+↓
+
+Process
+
+↓
+
+INSERT operation_id
+```
+
+Even after restarts,
+
+the protection remains.
+
+---
+
+### Real Payment Example
+
+Stripe uses an `Idempotency Key.`
+
+Client:
+
+```
+POST /payments
+```
+
+Header:
+```
+Idempotency-Key:
+
+3b91d26c-...
+```
+
+If the client retries:
+```
+Same Key
+
+↓
+
+Stripe
+
+↓
+
+Already Processed
+
+↓
+
+Return Previous Response
+```
+
+No duplicate charge
+
+---
+
+### Idempotency vs Deduplication
+
+These are different.
+
+#### Deduplication
+```
+Same job
+
+↓
+
+Don't enqueue twice
+```
+### Idempotency
+```
+Same operation executes twice
+
+↓
+
+Still safe
+```
+
+You should implement `both.`
+
+---
+
+### Testing
+#### Test 1 — Duplicate Queue Request
+
+Send:
+```
+{
+    "email": "same@gmail.com"
+}
+```
+
+twice.
+
+Verify that BullMQ does not create another waiting job with the same `jobId.`
+
+---
+
+
+### Test 2 — Retry
+
+Retry the completed job.
+
+Expected:
+
+```
+Duplicate job skipped
+```
+
+---
+
+### Test 3 — Restart Worker
+
+Restart the worker.
+
+Notice the in-memory `Set` is cleared.
+
+This demonstrates why a database-backed idempotency store is required in production.
+
+---
+
+### Production Notes
+
+For production systems:
+
+- Use business-specific jobId values (order ID, payment ID, invoice ID), not just an email address.
+- Store idempotency records in PostgreSQL or Redis, not in memory.
+- Make external API calls (payments, emails, webhooks) idempotent whenever possible.
+- Assume every job can be delivered more than once.
+
+---
+
+### Current Architecture
+```
+                 API
+                  │
+                  ▼
+           BullMQ Queue
+                  │
+          jobId prevents
+        duplicate enqueue
+                  │
+                  ▼
+               Worker
+                  │
+        Idempotency Check
+                  │
+        ┌─────────┴─────────┐
+        ▼                   ▼
+     Already Done       Not Done
+        │                   │
+        ▼                   ▼
+      Skip            Process Job
+                            │
+                            ▼
+                   Mark as Processed
+```
 
 
 
+### What You Learned
+
+You now understand:
+
+✅ Why retries can cause duplicate business operations.
+✅ The difference between queue-level deduplication and business-level idempotency.
+✅ How to use BullMQ jobId.
+✅ Why in-memory idempotency is only for learning.
+✅ Why production systems persist idempotency records.
+
+---
+
+### Module 1 — Lecture 6.14
+### Rate Limiting & Worker Throttling (Production Grade)
+
+Until now, our worker processes jobs as fast as possible.
+
+Imagine you have:
+
+```
+10,000 Email Jobs
+```
+
+and your worker has:
+```
+concurrency: 50
+```
+
+It may try to send hundreds of emails per second.
+
+But your email provider (SendGrid, SES, Mailgun, etc.) might allow only:
+
+```
+100 requests/minute
+```
+
+If you exceed that limit, you'll receive:
+
+```
+429 Too Many Requests
+```
+
+or your account could even be temporarily blocked.
+
+A production backend `must respect external service limits.`
+
+---
+
+### Today's Goal
+
+We'll limit our worker so it processes only a certain number of jobs within a time window.
+
+Current architecture:
+```
+Redis
+ │
+ ▼
+Worker
+ │
+ ▼
+100 jobs/sec ❌
+```
+
+After today's lecture:
+
+```
+Redis
+ │
+ ▼
+Worker
+ │
+ ▼
+Limiter
+ │
+ ▼
+10 jobs / 10 seconds ✅
+```
+
+---
+
+### What is Worker Throttling?
+
+Worker throttling means:
+
+- "Even if there are 10,000 waiting jobs, process them at a controlled rate."
+
+This protects:
+
+- Email providers
+- Payment gateways
+- SMS services
+- Your own database
+
+---
+
+### Step 1 — Open Worker File
+
+Open:
+
+```
+src/workers/email.worker.ts
+```
+
+Find
+```
+{
+    connection: redis,
+    concurrency: 5,
+}
+```
+
+---
+
+### Step 2 — Add a Limiter
+
+Replace it with:
+```
+{
+    connection: redis,
+
+    concurrency: 5,
+
+    limiter: {
+        max: 10,
+        duration: 10000,
+    },
+}
+```
+
+---
+
+### Understanding the Limiter
+```
+limiter: {
+    max: 10,
+    duration: 10000,
+}
+```
+
+means:
+```
+Maximum Jobs = 10
+
+Every
+
+10 seconds
+```
+
+So:
+```
+0s  → 10 jobs
+
+10s → next 10 jobs
+
+20s → next 10 jobs
+```
+
+---
+
+### Step 3 — Improve Logging
+
+In the worker, update your log:
+
+```
+logger.info(
+    {
+        jobId: job.id,
+        email: job.data.email,
+        processedAt: new Date().toISOString(),
+    },
+    "Email sent"
+);
+```
+
+This makes it easy to observe the processing rate
+
+---
+
+### Step 4 — Restart
+
+Terminal 1
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+---
+
+### Step 5 — Queue Many Jobs
+
+Create 25 jobs quickly.
+
+You can use Postman Runner, Bruno, Insomnia, or a simple shell loop.
+
+Example:
+```
+for i in {1..25}
+do
+curl -X POST http://localhost:5000/api/v1/send-email \
+-H "Content-Type: application/json" \
+-d "{\"email\":\"user$i@gmail.com\"}"
+done
+```
+
+---
+
+### Step 6 — Observe Logs
+
+Instead of:
+```
+25 jobs
+
+↓
+
+Immediately
+```
+
+You should see approximately:
+
+```
+00:00
+
+Job1
+...
+Job10
+
+↓
+
+(wait)
+
+00:10
+
+Job11
+...
+Job20
+
+↓
+
+(wait)
+
+00:20
+
+Job21
+...
+Job25
+```
+
+The limiter controls throughput.
+
+---
+
+### Step 7 — Concurrency vs Limiter
+
+Many developers confuse these.
+
+### Concurrency
+
+```
+concurrency: 5
+```
+
+means:
+```
+Maximum
+
+5 jobs
+
+running simultaneously.
+```
+
+---
+
+### Limiter
+
+```
+limiter: {
+
+max:10,
+
+duration:10000
+
+}
+```
+
+means:
+```
+Only
+
+10 jobs
+
+every
+
+10 seconds.
+```
+
+These solve different problems.
+
+---
+
+### Visual Example
+
+Suppose:
+
+```
+Concurrency = 5
+
+Limiter = 10 / 10 sec
+```
+
+Timeline:
+```
+Time 0
+
+Start 5 jobs
+
+↓
+
+They finish
+
+↓
+
+Start next 5
+
+↓
+
+10 jobs processed
+
+↓
+
+Limiter pauses
+
+↓
+
+10 seconds pass
+
+↓
+
+Next batch begins
+```
+
+---
+
+### Production Example
+
+Suppose Twilio allows:
+
+```
+60 SMS/minute
+```
+
+Configuration:
+```
+limiter: {
+
+max:60,
+
+duration:60000
+
+}
+```
+
+Worker never exceeds the provider's quota.
+
+---
+
+### Step 8 — Handling 429 Errors
+
+Sometimes the provider still returns:
+
+```
+429 Too Many Requests
+```
+
+When that happens:
+
+```
+Worker
+
+↓
+
+429
+
+↓
+
+Throw Error
+
+↓
+
+BullMQ Retry
+
+↓
+
+Backoff
+
+↓
+
+Later Retry
+```
+
+That's why retries and limiters work well together.
+
+---
+
+### Step 9 — Different Queues, Different Limits
+
+Imagine your system has:
+
+```
+Email Queue
+
+SMS Queue
+
+Payment Queue
+```
+
+Email:
+```
+100/minute
+```
+
+SMS:
+```
+20/minute
+```
+
+Payments:
+```
+5/second
+```
+
+Each worker can have its own limiter.
+
+---
+
+### Step 10 — Dynamic Rate Limits
+
+Some APIs return headers like:
+
+```
+X-RateLimit-Limit: 100
+
+X-RateLimit-Remaining: 45
+
+Retry-After: 60
+
+```
+
+Advanced systems can adjust their processing rate dynamically.
+
+We'll keep our limiter static for now.
+
+---
+
+### Step 11 — Why Not Just Sleep?
+
+Some beginners do this:
+
+```
+await new Promise(resolve =>
+    setTimeout(resolve, 1000)
+);
+```
+
+inside every job.
+
+Problems:
+
+- Wastes worker time.
+- Hard to maintain.
+- Doesn't coordinate multiple workers.
+
+BullMQ's limiter coordinates at the queue level, which is much more reliable.
+
+---
+
+### Step 12 — Production Recommendations
+
+Typical starting values:
+
+| Service        | Example Limit        |
+| -------------- | -------------------- |
+| Email Provider | 100/minute           |
+| SMS Provider   | 60/minute            |
+| Payment API    | 10/second            |
+| AI API         | Depends on your plan |
+
+
+`Always read the provider's documentation` before choosing limiter values.
+
+---
+
+### Testing
+Test 1 — Small Limit
+
+Set:
+```
+limiter: {
+    max: 2,
+    duration: 10000,
+}
+```
+
+Queue 6 jobs.
+
+Expected:
+
+```
+0s
+
+Job1
+
+Job2
+
+↓
+
+10s
+
+Job3
+
+Job4
+
+↓
+
+20s
+
+Job5
+
+Job6
+```
+
+### Test 2 — Increase Limit
+
+Change:
+```
+max: 5
+```
+
+Queue 10 jobs.
+
+Expected:
+
+```
+5 jobs
+
+↓
+
+Wait
+
+↓
+
+5 jobs
+```
+
+---
+
+### Test 3 — Remove Limiter
+
+Comment out:
+```
+limiter: {
+
+...
+}
+```
+
+Queue 10 jobs.
+
+Observe how quickly they are processed compared to the limited version.
+
+---
+
+### Common Mistakes
+
+❌ Setting:
+```
+concurrency: 100
+```
+
+without considering downstream limits.
+
+❌ Ignoring `429 Too Many Requests` responses.
+
+❌ Assuming concurrency automatically limits request rate.
+
+❌ Hardcoding delays with `setTimeout()` instead of using BullMQ's limiter.
+
+---
+
+### Production Notes
+
+A limiter is only one layer of protection.
+
+A complete production solution usually includes:
+
+- Queue limiter (BullMQ)
+- Retry with exponential backoff
+- Idempotent processing
+- Circuit breaker (for unhealthy services)
+- Monitoring and alerts
+
+Together, these keep your background workers stable under load.
+
+---
+
+### Project Status
+
+Your system now supports:
+
+✅ Express API (Producer)
+✅ Redis
+✅ BullMQ
+✅ Delayed Jobs
+✅ Retries
+✅ Exponential Backoff
+✅ Priorities
+✅ Dead Letter Queue (DLQ)
+✅ Job Monitoring APIs
+✅ Progress Tracking
+✅ Worker Concurrency
+✅ Graceful Shutdown
+✅ Idempotent Processing
+✅ Worker Rate Limiting
+
+This is already a strong production-grade foundation.
+
+---
+
+
+### Module 1 — Lecture 6.15
+### Queue Events & Real-Time Notifications (Production Grade)
+
+So far, our application works like this:
+```
+Client
+   │
+POST /send-email
+   │
+Returns jobId
+   │
+Client repeatedly calls
+GET /jobs/:id/progress
+```
+
+This is called `polling`.
+
+Polling works, but it wastes requests.
+
+A better approach is:
+```
+Worker
+   │
+BullMQ QueueEvents
+   │
+WebSocket / SSE
+   │
+Frontend updates instantly
+```
+
+This is how production dashboards show jobs updating in real time.
+
+---
+
+### Today's Goal
+
+We will learn how to listen to BullMQ events.
+
+BullMQ automatically emits events like:
+
+- waiting
+- active
+- progress
+- completed
+- failed
+- removed
+
+Instead of checking Redis every second, we subscribe to these events
+
+---
+
+### Project Structure
+
+Create a new folder:
+
+```
+src/
+│
+├── events/
+│   └── email.events.ts
+│
+├── workers/
+├── queues/
+├── controllers/
+└── routes/
+```
+
+---
+
+### Step 1 — Create Queue Events
+
+Create:
+```
+src/events/email.events.ts
+```
+
+Write:
+```
+import { QueueEvents } from "bullmq";
+import { redis } from "../config/redis";
+
+export const emailQueueEvents = new QueueEvents(
+    "email-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+Unlike a Worker, QueueEvents `does not process jobs.`
+
+It only listens.
+
+---
+
+### Step 2 — Register Event Listeners
+
+In the same file:
+```
+import { logger } from "../logger";
+```
+
+Add:
+```
+emailQueueEvents.on("waiting", ({ jobId }) => {
+    logger.info(
+        { jobId },
+        "Job waiting"
+    );
+});
+
+emailQueueEvents.on("active", ({ jobId }) => {
+    logger.info(
+        { jobId },
+        "Job started"
+    );
+});
+
+emailQueueEvents.on("completed", ({ jobId }) => {
+    logger.info(
+        { jobId },
+        "Job completed"
+    );
+});
+
+emailQueueEvents.on("failed", ({ jobId, failedReason }) => {
+    logger.error(
+        {
+            jobId,
+            failedReason,
+        },
+        "Job failed"
+    );
+});
+```
+
+---
+
+### Step 3 — Listen for Progress
+
+Add:
+
+```
+emailQueueEvents.on(
+    "progress",
+    ({ jobId, data }) => {
+        logger.info(
+            {
+                jobId,
+                progress: data,
+            },
+            "Progress updated"
+        );
+    }
+);
+```
+
+Remember:
+
+Earlier we called
+
+```
+await job.updateProgress({
+    percentage: 60,
+    step: "Generating HTML",
+});
+```
+
+Now every update automatically triggers this event.
+
+---
+
+### Step 4 — Start Queue Events
+
+Open:
+```
+src/worker.ts
+```
+
+Current:
+```
+import "./workers/email.worker";
+import "./workers/dlq.worker";
+```
+
+Add:
+```
+import "./events/email.events";
+```
+Final:
+```
+import "./workers/email.worker";
+import "./workers/dlq.worker";
+import "./events/email.events";
+```
+
+That's enough.
+
+The listeners register automatically.
+
+---
+
+### Step 5 — Restart
+
+API
+```
+npm run dev
+```
+
+Worker
+```
+npm run dev:worker
+```
+
+---
+
+### Step 6 — Create a Job
+
+```
+POST /api/v1/send-email
+```
+
+Body
+```
+{
+    "email": "events@test.com"
+}
+```
+
+---
+
+### Expected Logs
+
+You should now see something like:
+
+```
+Job waiting
+
+↓
+
+Job started
+
+↓
+
+Progress updated
+10%
+
+↓
+
+Progress updated
+30%
+
+↓
+
+Progress updated
+60%
+
+↓
+
+Progress updated
+80%
+
+↓
+
+Progress updated
+100%
+
+↓
+
+Job completed
+```
+
+Without calling any API.
+
+BullMQ pushes events automatically.
+
+---
+
+### Event Lifecycle
+```
+Producer
+
+↓
+
+Waiting
+
+↓
+
+Active
+
+↓
+
+Progress
+
+↓
+
+Completed
+```
+
+Or
+```
+Producer
+
+↓
+
+Waiting
+
+↓
+
+Active
+
+↓
+
+Failed
+```
+
+---
+
+### Step 7 — Store Event History
+
+Instead of only logging events, let's keep a short in-memory history for debugging.
+
+Create:
+```
+src/utils/event-history.ts
+```
+
+```
+export interface QueueEventRecord {
+    jobId: string;
+    type: string;
+    timestamp: string;
+}
+
+export const queueEventHistory: QueueEventRecord[] = [];
+```
+
+---
+
+Open:
+```
+src/events/email.events.ts
+```
+
+Import:
+```
+import {
+    queueEventHistory,
+} from "../utils/event-history";
+```
+
+Create a helper:
+```
+function recordEvent(
+    jobId: string,
+    type: string
+) {
+    queueEventHistory.push({
+        jobId,
+        type,
+        timestamp: new Date().toISOString(),
+    });
+
+    if (queueEventHistory.length > 100) {
+        queueEventHistory.shift();
+    }
+}
+```
+
+Update the listeners.
+
+Example:
+
+```
+emailQueueEvents.on(
+    "completed",
+    ({ jobId }) => {
+
+        recordEvent(jobId!, "completed");
+
+        logger.info(
+            { jobId },
+            "Job completed"
+        );
+    }
+);
+```
+
+Do the same for:
+
+- waiting
+- active
+- progress
+- failed
+
+Now your application remembers the latest 100 queue events.
+
+---
+
+### Step 8 — Expose Event History API
+
+Create:
+```
+src/controllers/events.controller.ts
+```
+
+```
+import { Request, Response } from "express";
+import { queueEventHistory } from "../utils/event-history";
+
+export function getQueueEvents(
+    req: Request,
+    res: Response
+) {
+    return res.json({
+        success: true,
+        count: queueEventHistory.length,
+        data: queueEventHistory,
+    });
+}
+```
+
+---
+
+Create:
+
+```
+src/routes/events.routes.ts
+```
+
+```
+import { Router } from "express";
+import { getQueueEvents } from "../controllers/events.controller";
+
+const router = Router();
+
+router.get("/", getQueueEvents);
+
+export default router;
+```
+
+---
+
+Open
+``` 
+src/app.ts
+```
+
+Import
+```
+import eventsRoutes from "./routes/events.routes";
+```
+
+Register:
+```
+app.use(
+    "/api/v1/events",
+    eventsRoutes
+);
+```
+
+---
+
+### Step 9 — Test the API
+
+After processing a few jobs:
+
+```
+GET /api/v1/events
+```
+
+```
+GET /api/v1/events
+```
+
+Example:
+```
+{
+    "success": true,
+    "count": 6,
+    "data": [
+        {
+            "jobId": "12",
+            "type": "waiting",
+            "timestamp": "2026-08-16T10:10:00.000Z"
+        },
+        {
+            "jobId": "12",
+            "type": "active",
+            "timestamp": "2026-08-16T10:10:01.000Z"
+        },
+        {
+            "jobId": "12",
+            "type": "progress",
+            "timestamp": "2026-08-16T10:10:02.000Z"
+        },
+        {
+            "jobId": "12",
+            "type": "completed",
+            "timestamp": "2026-08-16T10:10:06.000Z"
+        }
+    ]
+}
+```
+
+---
+
+### Why This Matters
+
+Real production dashboards don't constantly ask Redis:
+
+```
+GET /jobs/1
+
+GET /jobs/2
+
+GET /jobs/3
+
+GET /jobs/4
+```
+
+Instead:
+```
+BullMQ
+
+↓
+
+Queue Events
+
+↓
+
+WebSocket Server
+
+↓
+
+Browser
+```
+
+Only real changes are sent.
+
+Much faster.
+
+---
+
+### Production Architecture
+
+```
+             Redis
+               │
+               ▼
+         BullMQ Queue
+               │
+      ┌────────┴────────┐
+      ▼                 ▼
+ Worker          QueueEvents
+      │                 │
+      ▼                 ▼
+ Process Job      Listen Events
+                        │
+                        ▼
+              WebSocket / SSE
+                        │
+                        ▼
+                 React Dashboard
+```
 
 
 
+### Testing Checklist
+### Test 1
+
+Create a job.
+
+Verify logs appear in this order:
+
+```
+waiting
+
+↓
+
+active
+
+↓
+
+progress
+
+↓
+
+completed
+```
+
+---
+
+### Test 2
+
+Create a failing job.
+
+Verify:
+
+```
+waiting
+
+↓
+
+active
+
+↓
+
+failed
+```
+
+---
+
+### Test 3
+
+Call:
+
+```
+GET /api/v1/events
+```
+
+Verify the returned array contains recent queue events.
+
+---
+
+### Test 4
+
+Process more than 100 events.
+
+Verify only the latest 100 are kept.
+
+---
+
+Production Notes
+
+Our event history uses an in-memory array, which is fine for learning but not production.
+
+In a production system you would typically:
+
+- Send events to WebSocket clients.
+- Persist audit events to PostgreSQL or Elasticsearch if needed.
+- Export metrics (completed, failed, processing time) to monitoring tools like Prometheus and Grafana.
+- Keep QueueEvents in a dedicated monitoring service instead of mixing them with workers.
+
+---
+
+### What You Learned
+
+You can now:
+
+✅ Listen to BullMQ queue events.
+✅ Track the full lifecycle of every job.
+✅ Build the foundation for real-time dashboards.
+✅ Expose queue events through an API.
+✅ Understand how production systems stream job updates.
 
 
+---
+
+### Module 1 — Lecture 6.16
+### Scheduled Jobs & Cron Jobs (Production Grade)
+### What You'll Build
+
+Instead of users creating jobs manually:
+```
+POST /api/v1/send-email
+```
+
+the system itself will create jobs automatically.
+
+Examples:
+```
+Every day at 9 AM
+    ↓
+Send daily reports
+
+------------------------
+
+Every midnight
+    ↓
+Clean expired sessions
+
+------------------------
+
+Every Sunday
+    ↓
+Generate weekly analytics
+
+------------------------
+
+Every hour
+    ↓
+Backup database
+```
+
+This is how production systems automate recurring work.
+
+---
+
+### Architecture
+
+```
+                 Scheduler
+                     │
+                     ▼
+            Repeatable Job
+                     │
+                     ▼
+               Redis Queue
+                     │
+                     ▼
+                 Worker
+                     │
+                     ▼
+              Execute Task
+```
+
+Notice:
+
+The scheduler `does not execute the job.`
+
+It only `adds` jobs to the queue.
+
+Workers still process them.
+
+---
+
+### Step 1 — Create a Scheduler Folder
+
+Create:
+
+```
+background-job-system/
+└── src/
+    └── schedulers/
+```
+
+---
+
+### Step 2 — Create Scheduler
+
+Create:
+
+```
+src/schedulers/email.scheduler.ts
+```
+
+Write:
+```
+import { emailQueue } from "../queues/email.queue";
+import { logger } from "../logger";
+
+export async function registerEmailScheduler() {
+    await emailQueue.upsertJobScheduler(
+        "daily-report",
+
+        {
+            pattern: "*/30 * * * * *",
+        },
+
+        {
+            name: "daily-report",
+
+            data: {
+                report: true,
+            },
+
+            opts: {
+                removeOnComplete: 100,
+                removeOnFail: 100,
+            },
+        }
+    );
+
+    logger.info("Daily report scheduler registered");
+}
+```
+
+---
+
+### What is This?
+
+The cron pattern
+```
+*/30 * * * * *
+```
+
+means:
+```
+Every 30 seconds
+```
+
+We use 30 seconds so you don't have to wait until tomorrow.
+
+Later we'll change it to real schedules.
+
+---
+
+### Common Cron Patterns
+
+| Pattern          | Meaning               |
+| ---------------- | --------------------- |
+| `*/30 * * * * *` | Every 30 seconds      |
+| `0 * * * * *`    | Every minute          |
+| `0 0 * * * *`    | Every hour            |
+| `0 0 0 * * *`    | Every day at midnight |
+| `0 0 9 * * *`    | Every day at 9 AM     |
+| `0 0 9 * * 1`    | Every Monday 9 AM     |
+
+
+---
+
+### Step 3 — Register Scheduler
+
+Open
+```
+src/worker.ts
+```
+
+Import 
+```
+import { registerEmailScheduler } from "./schedulers/email.scheduler";
+```
+
+Now update the file.
+
+Near the top write:
+
+```
+async function start() {
+    await registerEmailScheduler();
+}
+
+start().catch((err) => {
+    logger.error(err, "Failed to start worker");
+    process.exit(1);
+});
+```
+
+Your worker.ts now:
+
+- starts workers
+- registers scheduler
+- handles shutdown
+
+---
+
+### Step 4 — Worker Changes
+
+Open
+```
+src/workers/email.worker.ts
+```
+
+Inside your processor:
+```
+if (job.name === "daily-report") {
+
+    logger.info(
+        "Generating scheduled report..."
+    );
+
+    await new Promise(resolve =>
+        setTimeout(resolve, 2000)
+    );
+
+    logger.info(
+        "Report generated."
+    );
+
+    return;
+}
+```
+
+Your worker can now process different job types.
+
+---
+
+### Step 5 — Restart
+
+API
+
+```
+npm run dev
+```
+
+Worker 
+```
+npm run dev:worker
+```
+
+---
+
+### Expected Output
+
+Every 30 seconds you'll see:
+
+```
+Daily report scheduler registered
+
+↓
+
+Generating scheduled report...
+
+↓
+
+Report generated.
+```
+
+Without callig any API
+
+---
+
+### Step 6 — Verify Queue
+
+Call
+
+```
+GET /api/v1/jobs?status=completed
+```
+
+You'll notice new jobs appearing automatically.
+
+Nobody created them.
+
+The scheduler did.
+
+---
+
+### Step 7 — Add Another Scheduler
+
+Open
+
+```
+src/schedulers/email.scheduler.ts
+```
+Add:
+```
+await emailQueue.upsertJobScheduler(
+    "cleanup",
+
+    {
+        pattern: "*/45 * * * * *",
+    },
+
+    {
+        name: "cleanup",
+
+        data: {},
+
+        opts: {
+            removeOnComplete: 100,
+        },
+    }
+);
+```
+
+---
+
+Worker:
+
+```
+if (job.name === "cleanup") {
+
+    logger.info(
+        "Cleaning temporary files..."
+    );
+
+    await new Promise(resolve =>
+        setTimeout(resolve, 1000)
+    );
+
+    logger.info(
+        "Cleanup completed."
+    );
+
+    return;
+}
+```
+
+Now you'll have:
+
+```
+Every 30 seconds
+
+↓
+
+Daily Report
+
+--------------------
+
+Every 45 seconds
+
+↓
+
+Cleanup
+```
+
+---
+
+### Step 8 — Production Folder Structure
+
+```
+src/
+│
+├── schedulers/
+│     ├── email.scheduler.ts
+│     ├── cleanup.scheduler.ts
+│     ├── reports.scheduler.ts
+│     └── analytics.scheduler.ts
+│
+├── workers/
+├── queues/
+└── controllers/
+```
+
+Large systems usually separate schedulers by domain.
+
+---
+
+### Step 9 — Avoid Duplicate Registration
+
+Imagine:
+```
+Worker 1
+
+Worker 2
+
+Worker 3
+```
+
+If every worker registers schedulers:
+
+```
+Worker1
+
+↓
+
+Register
+
+Worker2
+
+↓
+
+Register
+
+Worker3
+
+↓
+
+Register
+```
+
+Bad?
+
+Actually, `BullMQ's` upsertJobScheduler() is `idempotent.`
+
+It updates the existing scheduler instead of creating duplicates.
+
+Even so, many production teams run schedulers in a dedicated process.
+
+Architecture:
+
+```
+Scheduler Service
+
+↓
+
+Redis
+
+↓
+
+Workers
+```
+
+---
+
+### Step 10 — Production Examples
+
+Daily Reports
+```
+0 0 9 * * *
+```
+
+Every day at 9 AM.
+
+---
+
+Database Backup
+
+```
+0 0 2 * * *
+```
+
+Every night at 2 AM.
+
+---
+
+Delete Expired Sessions
+```
+0 */15 * * * *
+```
+
+Every 15 minutes.
+
+
+---
+
+Invoice Generation
+```
+0 0 0 1 * *
+```
+
+First day of every month.
+
+---
+
+Email Digest
+
+```
+0 30 8 * * 1-5
+```
+
+Weekdays at 8:30 AM.
+
+---
+
+### Step 11 — Production Tips
+
+Don't put business logic inside schedulers.
+
+Wrong:
+```
+Scheduler
+
+↓
+
+Generate Report
+
+↓
+
+Save PDF
+
+↓
+
+Email Users
+```
+
+Correct:
+```
+Scheduler
+
+↓
+
+Create Queue Job
+
+↓
+
+Worker
+
+↓
+
+Business Logic
+```
+
+Schedulers should only `schedule.`
+
+Workers should `work.`
+
+---
+
+### Testing
+### Test 1
+
+Start worker.
+
+Wait 30 seconds.
+
+Expected log:
+
+```
+Generating scheduled report...
+
+↓
+
+Report generated.
+```
+
+---
+
+### Test 2
+
+Wait another 30 seconds.
+
+Verify another report job runs automatically.
+
+---
+
+### Test 3
+
+Wait 45 seconds.
+
+Verify cleanup job runs.
+
+---
+
+### Test 4
+
+Stop the worker.
+
+Wait 2 minutes.
+
+Start the worker again.
+
+Observe how scheduled jobs continue from the scheduler without you manually creating them.
+
+---
+
+### Production Notes
+* Keep schedulers lightweight—they should enqueue work, not perform it.
+* Use meaningful scheduler IDs (daily-report, cleanup, etc.).
+* Separate scheduler registration from worker logic if you deploy multiple worker instances.
+* Store scheduler configuration in code or configuration files so deployments remain reproducible.
+
+
+---
+
+### Congratulations! 🎉
+
+You have completed Module 1.
+
+Your background job system now supports:
+
+✅ Redis + BullMQ
+✅ Producers & Workers
+✅ Logging & Error Handling
+✅ Retries & Exponential Backoff
+✅ Delayed Jobs
+✅ Priorities
+✅ Dead Letter Queue (DLQ)
+✅ Job Monitoring APIs
+✅ Progress Tracking
+✅ Worker Concurrency
+✅ Graceful Shutdown
+✅ Idempotent Processing
+✅ Rate Limiting
+✅ Queue Events
+✅ Scheduled & Cron Jobs
+
+This is a strong production-ready foundation.
+
+---
 

@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import app from "./app.js";
 import { redis } from "./config/redis.js";
 import { prisma } from "./config/database.js";
+import { logger } from "./logger/index.js";
 
 dotenv.config();
 
@@ -14,9 +15,23 @@ async function startServer() {
         const pong = await redis.ping()
         console.log(pong)
 
-        app.listen(PORT, () => {
-            console.log(`Server running on ${PORT}`);
+        const server = app.listen(PORT, () => {
+            logger.info(`Server running on ${PORT}`);
         });
+
+        async function shutdown(signal: string) {
+
+            logger.warn({ signal }, "API shutting down");
+
+            server.close(() => {
+                logger.info("HTTP server closed");
+            });
+
+            process.exit(0);
+        }
+
+        process.on("SIGINT", () => shutdown("SIGINT"));
+        process.on("SIGTERM", () => shutdown("SIGTERM"));
 
     } catch (error) {
 
