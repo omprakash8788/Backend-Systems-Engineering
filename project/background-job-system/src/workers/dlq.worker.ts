@@ -9,7 +9,7 @@ interface DeadLetterJob {
     failedAt: string;
 }
 
-new Worker<DeadLetterJob>(
+export const dlqWorker = new Worker<DeadLetterJob>(
     "dead-letter-queue",
 
     async (job: Job<DeadLetterJob>) => {

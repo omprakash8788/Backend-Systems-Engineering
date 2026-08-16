@@ -2,12 +2,12 @@ import { Worker, Job } from "bullmq";
 import { redis } from "../config/redis.js"
 import { logger } from "../logger/index.js";
 import { deadLetterQueue } from "../queues/dead-letter.queue.js";
-
+import { processedEmails } from "../utils/processed-jobs.js";
 interface EmailJobData {
     email: string;
 }
 
-const emailWorker = new Worker<EmailJobData>(
+export const emailWorker = new Worker<EmailJobData>(
     "email-queue",
     async (job: Job<EmailJobData>) => {
         logger.info({
@@ -16,6 +16,18 @@ const emailWorker = new Worker<EmailJobData>(
             attempt: job.attemptsMade + 1
 
         }, "Processing email job");
+
+        if (processedEmails.has(job.data.email)) {
+
+            logger.warn(
+                {
+                    email: job.data.email,
+                },
+                "Duplicate job skipped"
+            );
+
+            return;
+        }
 
         // Intentionally fail this job
         if (job.data.email === "fail@gmail.com") {
@@ -31,6 +43,43 @@ const emailWorker = new Worker<EmailJobData>(
 
         }, "Processing email job");
 
+
+        if (job.name === "daily-report") {
+
+            logger.info(
+                "Generating scheduled report..."
+            );
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 2000)
+            );
+
+            logger.info(
+                "Report generated."
+            );
+
+            return;
+        }
+
+
+        if (job.name === "cleanup") {
+
+            logger.info(
+                "Cleaning temporary files..."
+            );
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 1000)
+            );
+
+            logger.info(
+                "Cleanup completed."
+            );
+
+            return;
+        }
+
+
         //Step 1
 
         // await job.updateProgress(10);
@@ -41,7 +90,7 @@ const emailWorker = new Worker<EmailJobData>(
         });
 
         await new Promise((resolve) => {
-            setTimeout(resolve, 1000)
+            setTimeout(resolve, 10000)
         });
 
         // STEP 2
@@ -92,13 +141,20 @@ const emailWorker = new Worker<EmailJobData>(
         logger.info(
             {
                 jobId: job.id,
+                email: job.data.email,
+                processedAt: new Date().toISOString(),
             },
             "Email processed successfully"
         );
-
+        processedEmails.add(job.data.email);
     },
     {
         connection: redis,
+        concurrency: 5,
+        limiter: {
+            max: 10,
+            duration: 10000
+        }
     }
 
 );
