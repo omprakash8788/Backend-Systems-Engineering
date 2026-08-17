@@ -1,8 +1,8 @@
 import { Request, Response } from "express"
 
-import { emailQueue } from "../queues/email.queue.js"
+// import { emailQueue } from "../queues/email.queue.js"
 import { logger } from "../logger/index.js";
-
+import { QueueRouter } from "../services/queue-router.service.js";
 type EmailPriority = "high" | "normal" | "low";
 
 const PRIORITY_MAP: Record<EmailPriority, number> = {
@@ -13,7 +13,7 @@ const PRIORITY_MAP: Record<EmailPriority, number> = {
 
 export async function sendEmail(req: Request, res: Response) {
 
-    const { email, delay = 0,   priority = "normal",} = req.body;
+    const { email, delay = 0, priority = "normal", isPremium = false } = req.body;
 
     if (typeof email !== "string" || email.trim() === "") {
         return res.status(400).json({
@@ -34,7 +34,7 @@ export async function sendEmail(req: Request, res: Response) {
         });
     }
 
-     if (
+    if (
         priority !== "high" &&
         priority !== "normal" &&
         priority !== "low"
@@ -46,26 +46,33 @@ export async function sendEmail(req: Request, res: Response) {
         });
     }
 
-    const job = await emailQueue.add("send-email", {
-        email
-    },
-        {
-            jobId:email,
-            delay,
-            priority:PRIORITY_MAP[priority as EmailPriority],
-        }
+    // const job = await emailQueue.add("send-email", {
+    //     email
+    // },
+    //     {
+    //         jobId:email,
+    //         delay,
+    //         priority:PRIORITY_MAP[priority as EmailPriority],
+    //     }
 
-    
-    );
+
+    // );
 
     //  logger.info({ email }, "Adding job");
 
+    const job = await QueueRouter.sendEmail({
+        email,
+        isPremium,
+        delay,
+        priority: PRIORITY_MAP[priority as EmailPriority],
+    });
 
     return res.status(200).json({
         success: true,
         message: "Job Added Successfully",
         jobId: job.id,
         priority,
+        isPremium,
         delay
 
     })
