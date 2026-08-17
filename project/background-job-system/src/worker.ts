@@ -3,6 +3,10 @@ import { dlqWorker } from "./workers/dlq.worker.js"
 import { logger } from "./logger/index.js"
 import "./events/email.events.js"
 import { registerEmailScheduler } from "./schedulers/email.scheduler.js";
+import "./workers/pdf.worker.js";
+import "./workers/notification.worker.js";
+import "./workers/workflow.worker.js";
+import "./workers/premium-email.worker.js";
 
 
 
