@@ -9,6 +9,16 @@ export async function bulkEmail(
 
     const { emails } = req.body;
 
+    if (emails.length > 1000) {
+
+        throw new AppError(
+            400,
+            "Maximum batch size is 1000 emails",
+
+        );
+
+    }
+
     if (!Array.isArray(emails)) {
         throw new AppError(
             400,

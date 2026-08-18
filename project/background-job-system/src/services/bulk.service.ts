@@ -8,6 +8,22 @@ export class BulkService {
 
         const uniqueEmails = [...new Set(emails)];
 
+        const counts = await emailQueue.getJobCounts(
+            "waiting",
+            "active"
+        );
+
+        const totalPending =
+            counts.waiting + counts.active;
+
+        if (totalPending > 5000) {
+
+            throw new Error(
+                "Queue is overloaded. Please try again later."
+            );
+
+        }
+
         return emailQueue.addBulk(
 
             uniqueEmails.map((email) => ({

@@ -90,7 +90,7 @@ export const emailWorker = new Worker<EmailJobData>(
         });
 
         await new Promise((resolve) => {
-            setTimeout(resolve, 10000)
+            setTimeout(resolve, 1000)
         });
 
         // STEP 2

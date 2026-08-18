@@ -11,6 +11,7 @@ import notificationRoutes from "./routes/notification.routes.js";
 import workflowRoutes from "./routes/workflow.routes.js";
 import bulkRoutes from "./routes/bulk.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
+import pipelineRoutes from "./routes/pipeline.routes.js";
 
 
 const app = express();
@@ -29,6 +30,7 @@ app.use("/api/v1", notificationRoutes);
 app.use("/api/v1", workflowRoutes);
 app.use("/api/v1", bulkRoutes);
 app.use("/api/v1", adminRoutes);
+app.use("/api/v1",pipelineRoutes);
 app.use("/api/v1/jobs", jobsRoutes);
 app.use("/api/v1/events",eventsRoutes);
 

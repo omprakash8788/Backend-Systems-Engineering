@@ -1,5 +1,7 @@
 import { Request, Response } from "express";
 import { QueueManager } from "../services/queue-manager.service.js";
+import { QueueHealthService } from "../services/queue-health.service.js";
+
 
 export async function pauseQueue(
     req: Request,
@@ -46,6 +48,21 @@ export async function queueStatus(
         success: true,
         queue,
         status,
+    });
+
+}
+
+export async function queueHealth(
+    req: Request,
+    res: Response
+) {
+
+    const health =
+        await QueueHealthService.isHealthy();
+
+    return res.json({
+        success: true,
+        ...health,
     });
 
 }

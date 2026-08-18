@@ -7,7 +7,7 @@ import "./workers/pdf.worker.js";
 import "./workers/notification.worker.js";
 import "./workers/workflow.worker.js";
 import "./workers/premium-email.worker.js";
-
+import "./workers/pipeline.worker.js";
 
 
 async function start() {
