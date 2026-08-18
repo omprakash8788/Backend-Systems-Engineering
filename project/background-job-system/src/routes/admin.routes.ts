@@ -4,6 +4,7 @@ import {
     pauseQueue,
     resumeQueue,
     queueStatus,
+    queueHealth,
 } from "../controllers/admin.controller.js";
 
 const router = Router();
@@ -21,6 +22,12 @@ router.post(
 router.get(
     "/admin/queues/:queue/status",
     queueStatus
+);
+
+
+router.get(
+    "/admin/queues/health",
+    queueHealth
 );
 
 export default router;

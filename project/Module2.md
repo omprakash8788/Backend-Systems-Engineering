@@ -3909,5 +3909,1925 @@ You now know how to:
 ---
 
 
+### Lecture 6 — Queue Rate Limiting & Backpressure (Production Grade)
+
+ - Prerequisites: Complete Module 2 – Lectures 1–5.
+
+---
+
+### Why Rate Limiting Matters
+
+Imagine your worker processes emails as fast as possible.
+
+```
+10,000 jobs
+
+↓
+
+Email Worker
+
+↓
+
+SMTP Provider
+```
+
+If your SMTP provider only allows `100 emails per minute`, your worker may send:
+
+```
+2,000 emails/minute
+```
+
+Result:
+
+- ❌ HTTP 429 (Too Many Requests)
+- ❌ Temporary bans
+- ❌ Blocked IPs
+- ❌ Failed jobs
+- ❌ Endless retries
+
+---
+
+### What is Backpressure?
+
+Backpressure means:
+
+***Slow down the producer or worker when the downstream system can't keep up.***
+
+Without backpressure
+```
+Jobs
+
+↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+Worker
+
+↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+
+SMTP Server
+
+💥 OVERLOADED
+```
+
+With backpressure:
+```
+Jobs
+
+↓
+
+↓
+
+↓
+
+Worker
+
+↓
+
+↓
+
+↓
+
+SMTP Server
+
+✅ Stable
+```
+
+---
+
+### Today's Goal
+
+We'll implement:
+
+- ✅ Worker rate limiting
+- ✅ Queue-level throttling
+- ✅ API backpressure
+- ✅ Queue health monitoring
+- ✅ Production-safe configuration
+
+---
+
+### Architecture
+
+```
+            API
+
+             │
+
+             ▼
+
+        Email Queue
+
+             │
+
+      Rate Limiter
+
+             │
+
+             ▼
+
+       Email Worker
+
+             │
+
+             ▼
+
+      SMTP Provider
+```
+
+---
+
+### Step 1 — Configure Worker Rate Limiting
+
+Open:
+```
+src/workers/email.worker.ts
+```
+
+Find your worker options.
+
+Replace them with:
+
+```
+{
+    connection: redis,
+
+    concurrency: 5,
+
+    limiter: {
+        max: 10,
+        duration: 10000,
+    },
+}
+```
+
+---
+
+### What Does This Mean?
+```
+limiter: {
+    max: 10,
+    duration: 10000,
+}
+```
+
+Means:
+```
+Maximum:
+
+10 Jobs
+
+Every
+
+10 Seconds
+```
+
+Even if you enqueue:
+```
+500 Jobs
+```
+
+BullMQ processes them like:
+
+```
+10
+
+(wait)
+
+10
+
+(wait)
+
+10
+```
+
+Instead of 
+```
+500
+
+Immediately
+```
+
+---
+
+### Step 2 — Slow Down Worker (For Demo)
+
+Inside
+
+```
+src/workers/email.worker.ts
+```
+
+temporarily simulate an SMTP request:
+```
+await new Promise(resolve =>
+    setTimeout(resolve, 1000)
+);
+```
+
+Now each email takes about one second.
+
+This makes the limiter easier to observe.
+
+---
+
+### Step 3 — Generate Many Jobs
+
+Create
+```
+scripts/load-test.js
+```
+
+```
+const axios = require("axios");
+
+(async () => {
+
+    const emails = [];
+
+    for (let i = 1; i <= 100; i++) {
+
+        emails.push(
+            `user${i}@gmail.com`
+        );
+
+    }
+
+    await axios.post(
+        "http://localhost:5000/api/v1/bulk-email",
+        {
+            emails,
+        }
+    );
+
+    console.log("100 jobs queued");
+
+})();
+```
+
+---
+Run
+
+```
+node scripts/load-test.js
+```
+
+Expected:
+```
+100 jobs queued
+```
+
+Worker logs will appear gradually.
+
+---
+
+### Step 4 — Watch Queue Status
+
+Open another terminal.
+
+Call:
+
+```
+GET /api/v1/admin/queues/email/status
+```
+
+Initially:
+```
+{
+    "waiting": 90,
+    "active": 5,
+    "completed": 5
+}
+```
+
+After a while
+```
+{
+    "waiting": 60,
+    "active": 5,
+    "completed": 35
+}
+```
+
+Eventually:
+```
+{
+    "waiting": 0,
+    "active": 0,
+    "completed": 100
+}
+```
+
+The limiter is controlling throughput.
+
+---
+
+### Step 5 — Add API Backpressure
+
+Right now, clients can enqueue unlimited jobs.
+
+That's dangerous.
+
+Open:
+```
+src/controllers/bulk.controller.ts
+```
+
+Before calling BulkService, add:
+
+
+```
+if (emails.length > 1000) {
+
+    throw new AppError(
+        "Maximum batch size is 1000 emails",
+        400
+    );
+
+}
+```
+
+Now clients cannot enqueue millions of jobs in a single request.
+
+---
+
+### Step 6 — Queue Length Protection
+
+Open:
+```
+src/services/bulk.service.ts
+```
+
+Before adding jobs
+```
+const counts = await emailQueue.getJobCounts(
+    "waiting",
+    "active"
+);
+
+const totalPending =
+    counts.waiting + counts.active;
+
+if (totalPending > 5000) {
+
+    throw new Error(
+        "Queue is overloaded. Please try again later."
+    );
+
+}
+```
+
+Now if the queue is already overloaded, the API rejects new work.
+
+This is `backpressure.`
+
+---
+
+### Step 7 — Create Queue Health Service
+
+Create:
+```
+src/services/queue-health.service.ts
+```
+
+```
+import { emailQueue } from "../queues/email.queue.js";
+
+export class QueueHealthService {
+
+    static async isHealthy() {
+
+        const counts =
+            await emailQueue.getJobCounts(
+                "waiting",
+                "active"
+            );
+
+        const pending =
+            counts.waiting +
+            counts.active;
+
+        return {
+            healthy: pending < 5000,
+            pending,
+        };
+
+    }
+
+}
+
+```
+
+---
+
+### Step 8 — Add Health Endpoint
+
+Open
+```
+src/controllers/admin.controller.ts
+```
+
+Add:
+
+```
+import { QueueHealthService } from "../services/queue-health.service.js";
+
+export async function queueHealth(
+    req: Request,
+    res: Response
+) {
+
+    const health =
+        await QueueHealthService.isHealthy();
+
+    return res.json({
+        success: true,
+        ...health,
+    });
+
+}
+```
+
+---
+
+Open:
+```
+src/routes/admin.routes.ts
+```
+Add:
+```
+router.get(
+    "/admin/queues/health",
+    queueHealth
+);
+
+```
+
+Don't forget to import it:
+
+```
+import {
+    pauseQueue,
+    resumeQueue,
+    queueStatus,
+    queueHealth,
+} from "../controllers/admin.controller.js";
+```
+
+---
+
+### Test 1 — Worker Limiter
+
+Run:
+
+```
+node scripts/load-test.js
+```
+
+Expected:
+
+Jobs process gradually.
+
+Not instantly.
+
+---
+
+
+### Test 2 — Queue Health
+
+Request:
+
+```
+GET /api/v1/admin/queues/health
+```
+
+Example:
+```
+{
+    "success": true,
+    "healthy": true,
+    "pending": 37
+}
+```
+
+---
+
+### Test 3 — Batch Size Protection
+
+Request:
+```
+{
+    "emails":[
+        "...more than 1000..."
+    ]
+}
+```
+
+Expected:
+```
+400 Bad Request
+```
+
+---
+
+### Test 4 — Queue Overload
+
+Temporarily reduce the limit:
+
+```
+if (totalPending > 5)
+```
+
+Queue 20 jobs.
+
+Queue another batch.
+
+Expected:
+```
+Queue is overloaded.
+```
+
+Restore the threshold afterward.
+
+---
+
+### Test 5 — Pause + Limiter
+
+Pause the email queue.
+
+Queue 50 jobs.
+
+Resume.
+
+Observe:
+
+Jobs do not all execute simultaneously.
+
+The limiter still controls execution rate after resuming.
+
+---
+
+### Production Improvement
+
+Hardcoded values like:
+
+```
+5000
+1000
+10
+10000
+```
+
+should come from environment variables.
+
+Create:
+
+```
+.env
+```
+
+```
+EMAIL_WORKER_CONCURRENCY=5
+EMAIL_RATE_LIMIT_MAX=10
+EMAIL_RATE_LIMIT_DURATION=10000
+QUEUE_MAX_PENDING=5000
+MAX_BATCH_SIZE=1000
+```
+
+Then use them:
+```
+limiter: {
+    max: Number(process.env.EMAIL_RATE_LIMIT_MAX),
+    duration: Number(process.env.EMAIL_RATE_LIMIT_DURATION),
+}
+```
+
+This allows tuning production behavior without changing code.
+
+---
+
+### Real Production Examples
+#### Email Provider
+
+```
+SMTP Limit
+
+↓
+
+100 Emails / Minute
+
+↓
+
+Worker Limiter
+```
+
+---
+
+Payment Gateway
+```
+Stripe
+
+↓
+
+50 Requests / Second
+
+↓
+
+Payment Queue
+```
+
+---
+
+AI APIs
+
+```
+OpenAI API
+
+↓
+
+Rate Limit
+
+↓
+
+Inference Queue
+```
+
+---
+
+Image Processing
+
+```
+GPU
+
+↓
+
+Limited Capacity
+
+↓
+
+Backpressure
+```
+
+---
+
+### Final Architecture
+
+```
+                  API
+
+                   │
+
+         Batch Size Validation
+
+                   │
+
+                   ▼
+
+             Email Queue
+
+                   │
+
+         Queue Overload Check
+
+                   │
+
+                   ▼
+
+            Worker Limiter
+
+                   │
+
+                   ▼
+
+             SMTP Provider
+```
+
+---
+
+### Project Structure
+```
+src/
+├── controllers/
+│   ├── admin.controller.ts
+│   ├── bulk.controller.ts
+│   ├── email.controller.ts
+│   ├── notification.controller.ts
+│   ├── pdf.controller.ts
+│   └── workflow.controller.ts
+│
+├── services/
+│   ├── bulk.service.ts
+│   ├── queue-health.service.ts
+│   ├── queue-manager.service.ts
+│   ├── queue-registry.service.ts
+│   ├── queue-router.service.ts
+│   └── workflow.service.ts
+│
+├── workers/
+│   ├── email.worker.ts
+│   ├── premium-email.worker.ts
+│   ├── pdf.worker.ts
+│   ├── notification.worker.ts
+│   └── workflow.worker.ts
+│
+└── scripts/
+    └── load-test.js
+```
+
+---
+
+What You Learned
+
+You now know how to:
+
+- ✅ Apply worker rate limiting with BullMQ.
+- ✅ Protect downstream services from overload.
+- ✅ Implement API backpressure.
+- ✅ Reject work when queues become overloaded.
+- ✅ Expose queue health for monitoring.
+- ✅ Move operational limits into configuration.
+
+---
+---
+
+### Lecture 7 — Job Dependencies & Sequential Pipelines (Production Grade)
+
+***Prerequisites:*** Complete Module 2 – Lectures 1–6.
+
+---
+
+### Before We Start
+
+Many developers confuse `parallel workflows `with `sequential pipelines.`
+
+They are `not the same.`
+
+### Parallel Workflow (Previous Lecture)
+
+With `FlowProducer`, child jobs run independently.
+
+```
+                Generate Report
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+    Generate PDF   Send Email   Notify User
+```
+
+All three can execute simultaneously.
+
+
+---
+
+### Sequential Pipeline (Today's Lecture)
+
+Sometimes jobs `must` execute in order.
+
+```
+Import CSV
+
+↓
+
+Validate CSV
+
+↓
+
+Parse Records
+
+↓
+
+Save to Database
+
+↓
+
+Send Summary Email
+```
+
+If validation fails,
+
+nothing else should execute.
+
+---
+
+### Real Production Examples
+### Banking
+
+```
+Receive Payment
+
+↓
+
+Fraud Check
+
+↓
+
+Debit Account
+
+↓
+
+Credit Merchant
+
+↓
+
+Generate Receipt
+```
+
+---
+
+### Video Processing
+
+```
+Upload Video
+
+↓
+
+Virus Scan
+
+↓
+
+Transcode
+
+↓
+
+Generate Thumbnail
+
+↓
+
+Publish
+```
+
+---
+
+### E-commerce
+```
+Place Order
+
+↓
+
+Reserve Inventory
+
+↓
+
+Process Payment
+
+↓
+
+Create Shipment
+
+↓
+
+Send Confirmation
+```
+
+---
+
+### Today's Goal
+
+We'll build:
+
+```
+CSV Import Pipeline
+
+↓
+
+Validate
+
+↓
+
+Parse
+
+↓
+
+Save
+
+↓
+
+Notify
+```
+
+Each stage creates the next stage.
+
+---
+
+### Project Structure
+
+Create:
+
+```
+src/
+├── services/
+│      pipeline.service.ts
+│
+├── workers/
+│      pipeline.worker.ts
+│
+├── queues/
+│      pipeline.queue.ts
+│
+├── controllers/
+│      pipeline.controller.ts
+│
+└── routes/
+       pipeline.routes.ts
+```
+
+---
+
+### Architecture
+
+```
+API
+
+↓
+
+Pipeline Queue
+
+↓
+
+Pipeline Worker
+
+↓
+
+Step 1
+
+↓
+
+Step 2
+
+↓
+
+Step 3
+
+↓
+
+Step 4
+
+↓
+
+Done
+```
+
+Unlike FlowProducer,
+
+only one step executes at a time.
+
+---
+
+### Step 1 — Create Pipeline Queue
+
+File
+```
+src/queues/pipeline.queue.ts
+```
+```
+import { redis } from "../config/redis.js";
+
+export const pipelineQueue = new Queue(
+    "pipeline-queue",
+    {
+        connection: redis,
+    }
+);
+
+```
+
+---
+
+### Step 2 — Register Queue
+
+Open
+```
+src/services/queue-registry.service.ts
+```
+Add:
+```
+import { pipelineQueue } from "../queues/pipeline.queue.js";
+```
+
+Register:
+```
+pipeline: pipelineQueue,
+```
+
+Final example:
+```
+export const QueueRegistry = {
+    email: emailQueue,
+    premiumEmail: premiumEmailQueue,
+    pdf: pdfQueue,
+    notification: notificationQueue,
+    pipeline: pipelineQueue,
+};
+```
+
+---
+
+### Step 3 — Create Pipeline Service
+
+File
+```
+src/services/pipeline.service.ts
+```
+```
+import { pipelineQueue } from "../queues/pipeline.queue.js";
+
+export class PipelineService {
+
+    static async startImport(fileName: string) {
+
+        return pipelineQueue.add(
+            "validate",
+
+            {
+                fileName,
+            }
+        );
+
+    }
+
+}
+```
+
+The pipeline always starts with `validate.`
+
+---
+
+### Step 4 — Create Pipeline Worker
+
+File
+```
+src/workers/pipeline.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { pipelineQueue } from "../queues/pipeline.queue.js";
+import { logger } from "../logger/index.js";
+
+export const pipelineWorker = new Worker(
+    "pipeline-queue",
+
+    async (job) => {
+
+        switch (job.name) {
+
+            case "validate":
+
+                logger.info("Validating CSV");
+
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1000)
+                );
+
+                await pipelineQueue.add(
+                    "parse",
+                    job.data
+                );
+
+                break;
+
+            case "parse":
+
+                logger.info("Parsing CSV");
+
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1000)
+                );
+
+                await pipelineQueue.add(
+                    "save",
+                    job.data
+                );
+
+                break;
+
+            case "save":
+
+                logger.info("Saving records");
+
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1000)
+                );
+
+                await pipelineQueue.add(
+                    "notify",
+                    job.data
+                );
+
+                break;
+
+            case "notify":
+
+                logger.info("Sending summary email");
+
+                await new Promise(resolve =>
+                    setTimeout(resolve, 1000)
+                );
+
+                logger.info("Pipeline completed");
+
+                break;
+
+        }
+
+    },
+
+    {
+        connection: redis,
+        concurrency: 1,
+    }
+);
+```
+
+Notice:
+
+Each stage schedules the next stage.
+
+This creates a sequential pipeline.
+
+---
+
+### Step 5 — Register Worker
+
+Open
+```
+src/worker.ts
+```
+Add:
+```
+import "./workers/pipeline.worker.js";
+```
+
+---
+
+### Step 6 — Create Controller
+
+File
+```
+src/controllers/pipeline.controller.ts
+```
+
+```
+import { Request, Response } from "express";
+import { PipelineService } from "../services/pipeline.service.js";
+import { AppError } from "../utils/AppError.js";
+
+export async function importCsv(
+    req: Request,
+    res: Response
+) {
+
+    const { fileName } = req.body;
+
+    if (!fileName) {
+
+        throw new AppError(
+            "fileName is required",
+            400
+        );
+
+    }
+
+    const job =
+        await PipelineService.startImport(
+            fileName
+        );
+
+    return res.status(202).json({
+
+        success: true,
+
+        jobId: job.id,
+
+        message:
+            "CSV import pipeline started",
+
+    });
+
+}
+```
+
+---
+
+### Step 7 — Create Routes
+
+File
+```
+src/routes/pipeline.routes.ts
+```
+
+
+```
+import { Router } from "express";
+
+import { importCsv } from "../controllers/pipeline.controller.js";
+
+const router = Router();
+
+router.post(
+    "/pipeline/import",
+    importCsv
+);
+
+export default router;
+```
+
+---
+
+### Step 8 — Register Routes
+
+Open
+
+```
+src/app.ts
+```
+
+Import
+
+```
+import pipelineRoutes from "./routes/pipeline.routes.js";
+```
+
+Register
+```
+app.use(
+    "/api/v1",
+    pipelineRoutes
+);
+```
+
+---
+
+### Step 9 — Restart
+
+Terminal 1
+
+```
+npm run dev
+```
+
+Terminal 2
+
+```
+npm run dev:worker
+```
+
+---
+
+### Test 1 — Start Pipeline
+
+Request
+```
+POST /api/v1/pipeline/import
+```
+
+Body
+```
+{
+    "fileName":"customers.csv"
+}
+```
+
+Expected Response
+```
+{
+    "success":true,
+    "message":"CSV import pipeline started"
+}
+```
+
+
+---
+
+### Expected Worker Logs
+
+```
+Validating CSV
+
+↓
+
+Parsing CSV
+
+↓
+
+Saving records
+
+↓
+
+Sending summary email
+
+↓
+
+Pipeline completed
+```
+
+Everything executes in order
+
+---
+
+### Test 2 — Simulate Validation Failure
+
+Inside
+```
+src/workers/pipeline.worker.ts
+```
+
+Temporary code:
+```
+case "validate":
+
+    throw new Error(
+        "CSV is invalid"
+    );
+```
+
+Run again.
+
+Expected:
+
+```
+Validation
+
+↓
+
+Failed
+```
+
+No
+```
+Parse
+
+Save
+
+Notify
+```
+
+jobs are created.
+
+---
+
+### Test 3 — Restore Validation
+
+Remove the temporary error.
+
+Restart the worker.
+
+Run again.
+
+Pipeline completes successfully.
+
+---
+
+### Test 4 — Run Multiple Pipelines
+
+Submit:
+
+```
+{
+    "fileName":"users.csv"
+}
+```
+
+Then:
+```
+{
+    "fileName":"orders.csv"
+}
+```
+
+Observe:
+
+Each pipeline progresses independently, but each individual pipeline preserves its own sequence of steps.
+
+---
+
+### 🚨 Production Improvement (Very Important)
+
+The implementation above is `good for learning`, but `I would not ship it to production.`
+
+Why?
+
+Because one worker knows about every step:
+
+```
+switch(job.name) {
+    case "validate":
+    case "parse":
+    case "save":
+    case "notify":
+}
+```
+
+As the pipeline grows to 20–30 steps, this becomes hard to maintain.
+
+### Better production architectur
+
+
+```
+pipeline/
+
+├── validate.step.ts
+├── parse.step.ts
+├── save.step.ts
+├── notify.step.ts
+└── pipeline.worker.ts
+
+```
+
+Each step exports a handler:
+
+```
+export async function validateStep(job: Job) {
+    // validation logic
+}
+```
+
+Then the worker becomes:
+
+```
+const handlers = {
+    validate: validateStep,
+    parse: parseStep,
+    save: saveStep,
+    notify: notifyStep,
+};
+
+const handler = handlers[job.name];
+
+if (!handler) {
+    throw new Error(`Unknown step: ${job.name}`);
+}
+
+await handler(job);
+```
+
+This is the pattern you'll commonly see in large production codebases.
+
+---
+
+What You Learned
+
+You now know how to:
+
+- ✅ Build sequential job pipelines.
+- ✅ Chain jobs in a specific order.
+- ✅ Stop processing when a step fails.
+- ✅ Start the next step only after the current step succeeds.
+- ✅ Organize pipeline logic for maintainability.
+
+
+---
+---
+
+## Note skip ***Lecture 8***, we alrady done it.
+
+---
+
+### Lecture 8 — Queue Events, Progress Tracking & Real-Time Job Status (Production Grade)
+
+- ***Prerequisites:***  Complete Module 2 – Lectures 1–7.
+
+---
+
+### Why This Matters
+
+Imagine a user uploads a `2 GB` video.
+
+Your API responds:
+
+```
+{
+    "success": true,
+    "message": "Job queued"
+}
+
+```
+
+Then...
+
+Nothing.
+
+The user has no idea whether the job is:
+
+- Waiting
+- Running
+- 20% complete
+- Finished
+- Failed
+
+This is a terrible user experience.
+
+---
+
+Production Systems
+
+Companies like:
+
+- YouTube
+- GitHub
+- AWS
+- Cloudflare
+- OpenAI
+
+all expose job status.
+
+Example
+
+```
+Uploading...
+
+█████████░░░░░░░ 45%
+
+Processing...
+
+██████████████░ 80%
+
+Completed ✅
+```
+
+### Today's Goal
+
+We'll build:
+
+- ✅ Job progress
+- ✅ Queue events
+- ✅ Job status API
+- ✅ Progress updates
+- ✅ Event logging
+
+---
+
+### Architecture
+```
+                API
+
+                 │
+
+        Queue.add()
+
+                 │
+
+                 ▼
+
+              Worker
+
+                 │
+
+        job.updateProgress()
+
+                 │
+
+                 ▼
+
+            Redis
+
+                 │
+
+                 ▼
+
+         Job Status API
+```
+
+---
+
+### What We'll Build
+
+New endpoint
+```
+GET /api/v1/jobs/:jobId
+```
+
+Example response
+
+```
+{
+    "jobId":"15",
+    "state":"active",
+    "progress":60
+}
+```
+
+---
+
+### Folder Structure
+
+Create:
+```
+src/
+
+├── controllers/
+│      job.controller.ts
+│
+├── routes/
+│      job.routes.ts
+│
+└── services/
+       job.service.ts
+```
+
+---
+
+### Step 1 — Update Worker Progress
+
+Open
+```
+src/workers/email.worker.ts
+```
+
+Replace your processor with:
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const emailWorker = new Worker(
+
+    "email-queue",
+
+    async (job) => {
+
+        await job.updateProgress(10);
+
+        logger.info(
+            { jobId: job.id },
+            "Preparing email"
+        );
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        await job.updateProgress(40);
+
+        logger.info(
+            { jobId: job.id },
+            "Rendering template"
+        );
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        await job.updateProgress(70);
+
+        logger.info(
+            { jobId: job.id },
+            "Sending email"
+        );
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        await job.updateProgress(100);
+
+        logger.info(
+            { jobId: job.id },
+            "Email completed"
+        );
+
+    },
+
+    {
+        connection: redis,
+        concurrency: 5,
+    }
+
+);
+```
+
+---
+
+### Note - Don't changed 
+
+### Step 2 — Listen to Queue Events
+
+BullMQ provides a separate class:
+```
+QueueEvents
+```
+It listens for:
+```
+- waiting
+- active
+- progress
+- completed
+- failed
+```
+
+---
+
+Create
+```
+src/events/email.events.ts
+```
+
+```
+import { QueueEvents } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const emailEvents =
+    new QueueEvents(
+        "email-queue",
+        {
+            connection: redis,
+        }
+    );
+
+emailEvents.on(
+    "waiting",
+    ({ jobId }) => {
+
+        logger.info(
+            { jobId },
+            "Job waiting"
+        );
+
+    }
+);
+
+emailEvents.on(
+    "active",
+    ({ jobId }) => {
+
+        logger.info(
+            { jobId },
+            "Job active"
+        );
+
+    }
+);
+
+emailEvents.on(
+    "progress",
+    ({ jobId, data }) => {
+
+        logger.info(
+            {
+                jobId,
+                progress: data,
+            },
+            "Job progress"
+        );
+
+    }
+);
+
+emailEvents.on(
+    "completed",
+    ({ jobId }) => {
+
+        logger.info(
+            { jobId },
+            "Job completed"
+        );
+
+    }
+);
+
+emailEvents.on(
+    "failed",
+    ({ jobId, failedReason }) => {
+
+        logger.error(
+            {
+                jobId,
+                failedReason,
+            },
+            "Job failed"
+        );
+
+    }
+);
+```
+
+### Note - In our case, we have alrady 
+
+
+### Step 3 — Register Events
+
+Open
+```
+src/worker.ts
+```
+Add
+```
+import "./events/email.events.js";
+```
+
+---
+
+### Step 4 — Create Job Service
+
+Create
+```
+src/services/job.service.ts
+```
+
+```
+import { emailQueue } from "../queues/email.queue.js";
+
+export class JobService {
+
+    static async getJob(jobId: string) {
+
+        const job =
+            await emailQueue.getJob(jobId);
+
+        if (!job) {
+
+            return null;
+
+        }
+
+        return {
+
+            id: job.id,
+
+            name: job.name,
+
+            progress: job.progress,
+
+            state: await job.getState(),
+
+            attemptsMade:
+                job.attemptsMade,
+
+            delay: job.delay,
+
+            timestamp:
+                job.timestamp,
+
+            data: job.data,
+
+        };
+
+    }
+
+}
+```
+
+---
+
+### Step 5 — Create Controller
+
+Create
+```
+src/controllers/job.controller.ts
+```
+
+```
+import { Request, Response } from "express";
+import { AppError } from "../utils/AppError.js";
+import { JobService } from "../services/job.service.js";
+
+export async function getJobStatus(
+    req: Request,
+    res: Response
+) {
+
+    const { jobId } = req.params;
+
+    const job =
+        await JobService.getJob(jobId);
+
+    if (!job) {
+
+        throw new AppError(
+            "Job not found",
+            404
+        );
+
+    }
+
+    return res.json({
+
+        success: true,
+
+        job,
+
+    });
+
+}
+```
+
+### Note - Skip this lecture - We alrady done in Module one.
+
+
+---
+---
+
+### Note - Leacture 9 skip 
+
+
+
+
+
+
+
+
+
+
+
 
 
