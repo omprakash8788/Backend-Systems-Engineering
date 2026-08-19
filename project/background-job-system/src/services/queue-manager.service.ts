@@ -35,7 +35,15 @@ export class QueueManager {
 
     // }
 
-     static getQueue(name: keyof typeof queues) {
+    static getAllQueues() {
+        return Object.entries(queues).map(([name, queue]) => ({
+            name,
+            bullName: queue.name,
+        }));
+    }
+
+
+    static getQueue(name: keyof typeof queues) {
         return queues[name] ?? null;
     }
 

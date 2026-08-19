@@ -5819,15 +5819,1426 @@ export async function getJobStatus(
 
 ### Note - Leacture 9 skip 
 
+### Module 2 — Lecture 10
+### Multiple Queues Architecture (Production Grade)
+ - ***Prerequisites:*** Complete Module 2 – Lectures 1–9.
+
+---
+
+### Why One Queue Is Not Enough
+
+Many beginners put everything into a single queue.
+```
+email-queue
+
+├── Send Email
+├── Generate PDF
+├── Resize Image
+├── Notification
+├── AI Processing
+├── Export CSV
+├── Reports
+├── Webhook
+```
+
+Looks simple.
+
+But in production, this become a disaster.
+
+---
+
+Problem 1 — Slow Jobs Block Fast Jobs
+
+Imagine:
+```
+Generate PDF
+```
+takes 
+```
+45 seconds
+```
+
+while
+
+```
+Send OTP Email
+```
+
+takes
+```
+200 ms
+```
+
+If both share one queue:
+
+```
+PDF
+
+↓
+
+PDF
+
+↓
+
+PDF
+
+↓
+
+OTP Email
+```
+
+The OTP waits behind PDFs.
+
+Users complain.
+
+---
+
+### Problem 2 — Different Resource Usage
+
+Some jobs are:
+```
+CPU Intensive
+```
+
+- Image resize
+- Video encoding
+- AI inference
+- PDF rendering
+
+Others are:
+
+```
+I/O Intensive
+```
+
+- Email
+- SMS
+- Database sync
+- API calls
+
+CPU-heavy jobs can starve I/O jobs.
+
+---
+
+### Problem 3 — Different Priorities
+
+Example:
+```
+Password Reset Email
+```
+
+must be processed immediately.
+
+But
+```
+Weekly Analytics Report
+```
+can wait 30 minutes
+
+---
+
+### Production Architecture
+
+Instead of one queue:
+
+```
+                API
+
+                 │
+
+      Queue Router Service
+
+ ┌────────┬────────┬────────┬────────┐
+ │        │        │        │        │
+ ▼        ▼        ▼        ▼        ▼
+
+Email   PDF     Image   Notification Reports
+Queue   Queue    Queue      Queue      Queue
+```
+
+Each queue has its own workers.
+
+---
+
+### Today's Goal
+
+We'll build:
+
+- Dedicated queues by workload
+- Queue categories
+- Queue manager
+- Dynamic queue selection
+- Queue discovery API
+
+---
+
+### Folder Structure
+
+No new folders.
+
+We'll add:
+
+```
+src/
+
+├── queues/
+│      image.queue.ts
+│      report.queue.ts
+│
+├── workers/
+│      image.worker.ts
+│      report.worker.ts
+│
+├── controllers/
+│      queue.controller.ts
+│
+├── routes/
+│      queue.routes.ts
+│
+└── services/
+       queue-manager.service.ts
+```
+
+---
+
+### Step 1 — Create Image Queue
+File
+```
+src/queues/image.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const imageQueue = new Queue(
+    "image-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 2 — Create Report Queue
+#### File
+```
+src/queues/report.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const reportQueue = new Queue(
+    "report-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 3 — Register New Queues
+
+Open
+```
+src/services/queue-registry.service.ts
+```
+
+Add imports:
+```
+import { imageQueue } from "../queues/image.queue.js";
+import { reportQueue } from "../queues/report.queue.js";
+```
+
+Update:
+```
+export const QueueRegistry = {
+
+    email: emailQueue,
+
+    premiumEmail: premiumEmailQueue,
+
+    notification: notificationQueue,
+
+    pdf: pdfQueue,
+
+    pipeline: pipelineQueue,
+
+    deadLetter: deadLetterQueue,
+
+    image: imageQueue,
+
+    report: reportQueue,
+
+};
+
+```
+
+---
+
+### Step 4 — Create Workers
+### File
+```
+src/workers/image.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const imageWorker = new Worker(
+
+    "image-queue",
+
+    async (job) => {
+
+        logger.info(
+            {
+                jobId: job.id,
+                image: job.data.image,
+            },
+            "Processing image"
+        );
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 3000)
+        );
+
+        logger.info(
+            { jobId: job.id },
+            "Image processed"
+        );
+
+    },
+
+    {
+        connection: redis,
+        concurrency: 2,
+    }
+
+);
+```
+
+---
+
+### File
+```
+src/workers/report.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const reportWorker = new Worker(
+
+    "report-queue",
+
+    async (job) => {
+
+        logger.info(
+            {
+                jobId: job.id,
+                report: job.data.report,
+            },
+            "Generating report"
+        );
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 5000)
+        );
+
+        logger.info(
+            { jobId: job.id },
+            "Report generated"
+        );
+
+    },
+
+    {
+        connection: redis,
+        concurrency: 1,
+    }
+
+);
+```
+
+---
+
+### Step 5 — Register Workers
+
+Open
+
+```
+src/worker.ts
+```
+
+Add:
+```
+import "./workers/image.worker.js";
+import "./workers/report.worker.js";
+```
+
+---
+
+### Step 6 — Extend Queue Manager
+
+Open
+```
+src/services/queue-manager.service.ts
+```
+
+Replace with:
+
+```
+import { QueueRegistry } from "./queue-registry.service.js";
+
+export class QueueManager {
+
+    static getAllQueues() {
+        return Object.entries(queues).map(([name, queue]) => ({
+            name,
+            bullName: queue.name,
+        }));
+    }
+
+}
+```
+
+---
+
+### Step 7 — Queue Discovery API
+##### File
+
+```
+src/controllers/queue.controller.ts
+```
+
+```
+import { Request, Response } from "express";
+import { QueueManager } from "../services/queue-manager.service.js";
+
+export async function getQueues(
+    req: Request,
+    res: Response
+) {
+
+    const queues =
+        QueueManager.getAllQueues();
+
+    return res.json({
+
+        success: true,
+
+        total: queues.length,
+
+        queues,
+
+    });
+
+}
+```
+
+---
+
+### Step 8 — Routes
+### File
+
+```
+src/routes/queue.routes.ts
+```
+
+```
+import { Router } from "express";
+import { getQueues } from "../controllers/queue.controller.js";
+
+const router = Router();
+
+router.get(
+    "/admin/queues",
+    getQueues
+);
+
+export default router;
+```
+
+---
+
+### Step 9 — Register Routes
+
+Open
+```
+src/app.ts
+```
+
+Import:
+```
+import queueRoutes from "./routes/queue.routes.js";
+```
+
+Register:
+```
+app.use(
+    "/api/v1",
+    queueRoutes
+);
+
+```
+
+---
+
+### Step 10 — Add Test Endpoints
+
+Instead of Postman hacks, create proper endpoints.
+
+### File
+
+```
+src/controllers/demo.controller.ts
+```
+```
+import { Request, Response } from "express";
+import { imageQueue } from "../queues/image.queue.js";
+import { reportQueue } from "../queues/report.queue.js";
+
+export async function createImageJob(
+    req: Request,
+    res: Response
+) {
+
+    const job = await imageQueue.add(
+        "resize-image",
+        {
+            image: req.body.image,
+        }
+    );
+
+    return res.status(202).json({
+        success: true,
+        jobId: job.id,
+    });
+
+}
+
+export async function createReportJob(
+    req: Request,
+    res: Response
+) {
+
+    const job = await reportQueue.add(
+        "generate-report",
+        {
+            report: req.body.report,
+        }
+    );
+
+    return res.status(202).json({
+        success: true,
+        jobId: job.id,
+    });
+
+}
+```
+
+---
+
+### File
+```
+
+src/routes/demo.routes.ts
+```
+
+```
+import { Router } from "express";
+import {
+    createImageJob,
+    createReportJob,
+} from "../controllers/demo.controller.js";
+
+const router = Router();
+
+router.post(
+    "/demo/image",
+    createImageJob
+);
+
+router.post(
+    "/demo/report",
+    createReportJob
+);
+
+export default router;
+```
+
+Register in `src/app.ts:`
+
+```
+import demoRoutes from "./routes/demo.routes.js";
+
+app.use("/api/v1", demoRoutes);
+```
+
+---
+
+
+### Testing
+### Test 1 — Queue Discovery
+
+```
+GET /api/v1/admin/queues
+```
+
+Expected:
+```
+{
+  "success": true,
+  "total": 7,
+  "queues": [
+    {
+      "name": "email",
+      "bullName": "email-queue"
+    },
+    {
+      "name": "notification",
+      "bullName": "notification-queue"
+    },
+    {
+      "name": "image",
+      "bullName": "image-queue"
+    },
+    {
+      "name": "report",
+      "bullName": "report-queue"
+    }
+  ]
+}
+```
+
+---
+
+### Test 2 — Image Queue
+```
+POST /api/v1/demo/image
+```
+
+Body
+```
+{
+    "image":"photo.jpg"
+}
+```
+
+Worker log:
+
+```
+Processing image
+
+↓
+
+Image processed
+```
+
+---
+
+### Test 3 — Report Queue
+
+```
+POST /api/v1/demo/report
+```
+
+Body
+```
+{
+    "report":"sales-report"
+}
+```
+
+---
+
+Test 4 — Parallel Processing
+
+Queue both jobs quickly:
+
+```
+POST /demo/image
+
+POST /demo/report
+```
+
+Observe:
+```
+Image Worker
+
+↓
+
+Processing image
+```
+
+At the same time:
+
+```
+Report Worker
+
+↓
+
+Generating report
+```
+
+Neither queue blocks the other.
+
+---
+
+
+### Why This Is Better
+
+Instead of:
+```
+One Queue
+
+↓
+
+Everything waits
+```
+You now have:
+
+```
+Email Queue
+
+↓
+
+Fast
+
+----------------
+
+Image Queue
+
+↓
+
+CPU Heavy
+
+----------------
+
+Report Queue
+
+↓
+
+Long Running
+```
+
+Each workload is isolated.
+
+---
+
+### Common Mistakes
+
+❌ Creating one queue per user (millions of queues).
+
+❌ Using a single queue for unrelated workloads.
+
+❌ Setting the same concurrency for CPU-bound and I/O-bound workers.
+
+❌ Sharing retry policies across very different job types.
+
+---
+
+### Production Notes
+
+At this stage, we're still creating queues manually.
+
+Large systems typically avoid this by:
+
+- Centralizing queue registration.
+- Auto-discovering queues.
+- Loading queue configuration from files.
+- Creating workers dynamically from configuration.
+
+We'll build those capabilities in later lectures when we cover worker scaling and queue sharding.
+
+
+### What You Learned
+
+You can now:
+
+- ✅ Organize work into multiple dedicated queues.
+- ✅ Assign separate workers to different workloads.
+- ✅ Discover registered queues programmatically.
+- ✅ Process CPU-bound and I/O-bound jobs independently.
+
+---
+---
+
+### Module 2 — Lecture 11
+#### Fan-Out Pattern (One Job → Many Independent Jobs)
+
+- Prerequisites: Complete Module 2 – Lectures 1–10.
+
+---
+
+### What is Fan-Out?
+
+A `Fan-Out` pattern means:
+
+One incoming job creates `multiple independent jobs` that can execute in `parallel.`
+
+Unlike the sequential pipeline from Lecture 7:
+
+```
+Upload
+
+↓
+
+Validate
+
+↓
+
+Parse
+
+↓
+
+Save
+
+↓
+
+Notify
+```
+
+Fan-Out looks like this:
+```
+                Upload Image
+
+                      │
+
+      ┌───────────────┼────────────────┐
+
+      ▼               ▼                ▼
+
+ Thumbnail       Watermark        Compress
+
+      ▼               ▼                ▼
+
+ AI Tags      Virus Scan      Extract Metadata
+```
+
+Everything runs `at the same time.`
+
+---
+
+### Real Production Examples
+### Instagram
+```
+Upload Photo
+
+        │
+
+────────┼────────
+
+Thumbnail
+
+Watermark
+
+Compression
+
+AI Detection
+
+Metadata
+
+Virus Scan
+```
+
+---
+
+### YouTube
+
+```
+Upload Video
+
+        │
+
+────────┼────────
+
+480p
+
+720p
+
+1080p
+
+Thumbnail
+
+Preview GIF
+```
+---
+
+### PDF System
+
+```
+Upload PDF
+
+        │
+
+────────┼────────
+
+OCR
+
+Virus Scan
+
+Generate Preview
+
+Extract Text
+```
+
+---
+
+### Today's Goal
+
+We'll build:
+
+```
+POST /upload-image
+
+        │
+
+        ▼
+
+Image Fan-Out Service
+
+        │
+
+────────┼──────────────┬──────────────┬──────────────┐
+
+Thumbnail Queue
+
+Compression Queue
+
+Metadata Queue
+
+AI Queue
+```
+
+Each task is independent.
+
+---
+
+### Folder Structure
+
+Create the following files:
+
+```
+src/
+
+├── queues/
+│   ├── thumbnail.queue.ts
+│   ├── compression.queue.ts
+│   ├── metadata.queue.ts
+│   └── ai.queue.ts
+│
+├── workers/
+│   ├── thumbnail.worker.ts
+│   ├── compression.worker.ts
+│   ├── metadata.worker.ts
+│   └── ai.worker.ts
+│
+├── services/
+│   └── image-fanout.service.ts
+│
+├── controllers/
+│   └── upload.controller.ts
+│
+└── routes/
+    └── upload.routes.ts
+```
+
+---
+
+### Architecture
+```
+                API
+
+                 │
+
+      ImageFanoutService
+
+                 │
+
+     ┌───────────┼────────────┬────────────┐
+
+     ▼           ▼            ▼            ▼
+
+Thumbnail   Compression   Metadata     AI Queue
+ Queue          Queue        Queue
+```
+
+---
+
+### Step 1 — Create Thumbnail Queue
+### File
+```
+src/queues/thumbnail.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const thumbnailQueue = new Queue(
+    "thumbnail-queue",
+    {
+        connection: redis,
+    }
+);
+
+```
+
+---
+
+### Step 2 — Create Compression Queue
+### File
+```
+src/queues/compression.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const compressionQueue = new Queue(
+    "compression-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 3 — Create Metadata Queue
+### File
+```
+src/queues/metadata.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const metadataQueue = new Queue(
+    "metadata-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 4 — Create AI Queue
+### File
+```
+src/queues/ai.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const aiQueue = new Queue(
+    "ai-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 5 — Register Queues
+### File
+```
+src/services/queue-registry.service.ts
+```
+
+Add imports:
+```
+import { thumbnailQueue } from "../queues/thumbnail.queue.js";
+import { compressionQueue } from "../queues/compression.queue.js";
+import { metadataQueue } from "../queues/metadata.queue.js";
+import { aiQueue } from "../queues/ai.queue.js";
+```
+
+Register them:
+```
+thumbnail: thumbnailQueue,
+compression: compressionQueue,
+metadata: metadataQueue,
+ai: aiQueue,
+```
+
+---
+
+### Step 6 — Create Workers
+### File
+```
+src/workers/thumbnail.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const thumbnailWorker = new Worker(
+    "thumbnail-queue",
+    async (job) => {
+        logger.info({ file: job.data.file }, "Generating thumbnail");
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        logger.info("Thumbnail completed");
+    },
+    {
+        connection: redis,
+        concurrency: 2,
+    }
+);
+```
+
+---
+
+### File
+```
+src/workers/compression.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const compressionWorker = new Worker(
+    "compression-queue",
+    async (job) => {
+        logger.info({ file: job.data.file }, "Compressing image");
+
+        await new Promise(resolve => setTimeout(resolve, 3000));
+
+        logger.info("Compression completed");
+    },
+    {
+        connection: redis,
+        concurrency: 2,
+    }
+);
+```
+
+---
+
+### File 
+
+```
+src/workers/metadata.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const metadataWorker = new Worker(
+    "metadata-queue",
+    async (job) => {
+        logger.info({ file: job.data.file }, "Extracting metadata");
+
+        await new Promise(resolve => setTimeout(resolve, 1500));
+
+        logger.info("Metadata extracted");
+    },
+    {
+        connection: redis,
+        concurrency: 2,
+    }
+);
+```
+
+---
+
+### File 
+```
+src/workers/ai.worker.ts
+```
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const aiWorker = new Worker(
+    "ai-queue",
+    async (job) => {
+        logger.info({ file: job.data.file }, "Running AI tagging");
+
+        await new Promise(resolve => setTimeout(resolve, 4000));
+
+        logger.info("AI tagging completed");
+    },
+    {
+        connection: redis,
+        concurrency: 1,
+    }
+);
+```
+
+---
+
+### Step 7 — Register Workers
+### File
+```
+src/worker.ts
+```
+Add:
+```
+import "./workers/thumbnail.worker.js";
+import "./workers/compression.worker.js";
+import "./workers/metadata.worker.js";
+import "./workers/ai.worker.js";
+```
+
+---
+
+### Step 8 — Create Fan-Out Service
+### File
+```
+src/services/image-fanout.service.ts
+```
+
+```
+import { aiQueue } from "../queues/ai.queue.js";
+import { compressionQueue } from "../queues/compression.queue.js";
+import { metadataQueue } from "../queues/metadata.queue.js";
+import { thumbnailQueue } from "../queues/thumbnail.queue.js";
+
+export class ImageFanoutService {
+
+    static async process(file: string) {
+
+        const payload = { file };
+
+        await Promise.all([
+            thumbnailQueue.add("thumbnail", payload),
+            compressionQueue.add("compression", payload),
+            metadataQueue.add("metadata", payload),
+            aiQueue.add("ai-tagging", payload),
+        ]);
+
+    }
+
+}
+```
+
+`Production note`: We use Promise.all() because all four enqueue operations are independent.
+
+---
+
+### Step 9 — Create Controller
+### File
+```
+src/controllers/upload.controller.ts
+```
+
+```
+import { Request, Response } from "express";
+import { AppError } from "../utils/AppError.js";
+import { ImageFanoutService } from "../services/image-fanout.service.js";
+
+export async function uploadImage(
+    req: Request,
+    res: Response
+) {
+
+    const { file } = req.body;
+
+    if (!file) {
+        throw new AppError(
+            "file is required",
+            400
+        );
+    }
+
+    await ImageFanoutService.process(file);
+
+    return res.status(202).json({
+        success: true,
+        message: "Image processing started"
+    });
+
+}
+```
+
+---
+
+### Step 10 — Create Routes
+File
+```
+src/routes/upload.routes.ts
+```
+
+```
+import { Router } from "express";
+import { uploadImage } from "../controllers/upload.controller.js";
+
+const router = Router();
+
+router.post(
+    "/upload-image",
+    uploadImage
+);
+
+export default router;
+```
+
+---
+
+### Step 11 — Register Routes
+### File
+```
+src/app.ts
+```
+
+Import 
+```
+import uploadRoutes from "./routes/upload.routes.js";
+```
+
+Register 
+```
+app.use("/api/v1", uploadRoutes);
+```
+---
+Testing
+
+---
+
+### Test 1 — Upload Image
+```
+POST /api/v1/upload-image
+```
+Body
+```
+{
+    "file":"beach.jpg"
+}
+```
+
+Expected response:
+```
+{
+    "success": true,
+    "message": "Image processing started"
+}
+
+```
+---
+
+### Test 2 — Observe Worker Logs
+
+All workers should start independently.
+
+Example:
+```
+Thumbnail Worker
+
+Generating thumbnail
+
+--------------------
+
+Compression Worker
+
+Compressing image
+
+--------------------
+
+Metadata Worker
+
+Extracting metadata
+
+--------------------
+
+AI Worker
+
+Running AI tagging
+
+```
+
+Notice that all workers begin processing without waiting for one another.
+
+---
+
+### Test 3 — Verify Parallel Execution
+
+Because we intentionally used different delays:
+
+| Worker      | Delay |
+| ----------- | ----: |
+| Metadata    | 1.5 s |
+| Thumbnail   |   2 s |
+| Compression |   3 s |
+| AI          |   4 s |
+
+
+Completion order should be:
+```
+Metadata
+
+↓
+
+Thumbnail
+
+↓
+
+Compression
+
+↓
+
+AI
+```
+
+Even though they started simultaneously.
+
+---
+
+### Test 4 — Queue Inspection
+
+Call your queue status endpoint for each queue (created in previous lectures).
+
+Example:
+```
+GET /api/v1/admin/queues/image/status
+```
+
+Repeat for:
+
+- thumbnail
+- compression
+- metadata
+- ai
+
+Verify that each queue receives exactly one job
+
+---
 
 
 
+### What You Learned
 
+You can now:
 
+✅ Implement the Fan-Out pattern.
+✅ Split one incoming request into multiple independent jobs.
+✅ Execute different workloads in parallel using separate queues.
+✅ Design services that enqueue work efficiently.
 
-
-
-
-
-
-
+---

@@ -8,7 +8,12 @@ import "./workers/notification.worker.js";
 import "./workers/workflow.worker.js";
 import "./workers/premium-email.worker.js";
 import "./workers/pipeline.worker.js";
-
+import "./workers/image.worker.js";
+import "./workers/report.worker.js";
+import "./workers/thumbnail.worker.js";
+import "./workers/compression.worker.js";
+import "./workers/metadata.worker.js";
+import "./workers/ai.worker.js";
 
 async function start() {
     await registerEmailScheduler();

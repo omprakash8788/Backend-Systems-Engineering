@@ -12,6 +12,11 @@ import workflowRoutes from "./routes/workflow.routes.js";
 import bulkRoutes from "./routes/bulk.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
 import pipelineRoutes from "./routes/pipeline.routes.js";
+import queueRoutes from "./routes/queue.routes.js";
+
+import demoRoutes from "./routes/demo.routes.js";
+import uploadRoutes from "./routes/upload.routes.js";
+
 
 
 const app = express();
@@ -23,14 +28,16 @@ app.use(pinoHttp({ logger }))
 app.use("/health", healthRoutes)
 
 
-
+app.use("/api/v1", uploadRoutes);
 app.use("/api/v1" ,emailRoutes);
 app.use("/api/v1", pdfRoutes);
 app.use("/api/v1", notificationRoutes);
+app.use("/api/v1", demoRoutes);
 app.use("/api/v1", workflowRoutes);
 app.use("/api/v1", bulkRoutes);
 app.use("/api/v1", adminRoutes);
 app.use("/api/v1",pipelineRoutes);
+app.use("/api/v1",queueRoutes);
 app.use("/api/v1/jobs", jobsRoutes);
 app.use("/api/v1/events",eventsRoutes);
 
