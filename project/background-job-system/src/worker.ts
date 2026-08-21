@@ -14,6 +14,7 @@ import "./workers/thumbnail.worker.js";
 import "./workers/compression.worker.js";
 import "./workers/metadata.worker.js";
 import "./workers/ai.worker.js";
+import "./workers/aggregation.worker.js";
 
 async function start() {
     await registerEmailScheduler();

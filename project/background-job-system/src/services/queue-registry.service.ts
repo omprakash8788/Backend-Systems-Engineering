@@ -9,6 +9,7 @@ import { thumbnailQueue } from "../queues/thumbnail.queue.js";
 import { compressionQueue } from "../queues/compression.queue.js";
 import { metadataQueue } from "../queues/metadata.queue.js";
 import { aiQueue } from "../queues/ai.queue.js";
+import { aggregationQueue } from "../queues/aggregation.queue.js";
 
 
 export const QueueRegistry = {
@@ -34,5 +35,7 @@ export const QueueRegistry = {
     metadata: metadataQueue,
     
     ai: aiQueue,
+
+    aggregation: aggregationQueue,
 
 };
