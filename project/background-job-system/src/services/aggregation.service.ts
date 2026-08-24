@@ -1,54 +1,54 @@
-type PipelineStatus = {
-
-    total: number;
-
-    completed: number;
-
-};
-
-const pipelines =
-    new Map<string, PipelineStatus>();
+import { redis } from "../config/redis.js";
 
 export class AggregationService {
 
-    static initialize(
+    static async initialize(
         pipelineId: string,
         total: number
     ) {
 
-        pipelines.set(
-            pipelineId,
-            {
+        const key = `pipeline:${pipelineId}`;
 
-                total,
+        await redis.hset(key, "total", total.toString());
+        await redis.hset(key, "completed", "0");
 
-                completed: 0,
-
-            }
-        );
-
+        console.log(await redis.hgetall(key));
     }
 
-    static complete(
+    static async complete(
+        pipelineId: string
+    ): Promise<boolean> {
+
+        const key = `pipeline:${pipelineId}`;
+
+        const completed = await redis.hincrby(
+            key,
+            "completed",
+            1
+        );
+
+        const total = Number(
+            await redis.hget(
+                key,
+                "total"
+            )
+        );
+
+        console.log({
+            key,
+            completed,
+            total,
+        });
+
+        return completed === total;
+    }
+
+    static async remove(
         pipelineId: string
     ) {
 
-        const pipeline =
-            pipelines.get(
-                pipelineId
-            );
-
-        if (!pipeline) {
-
-            return false;
-
-        }
-
-        pipeline.completed++;
-
-        return (
-            pipeline.completed ===
-            pipeline.total
+        await redis.del(
+            `pipeline:${pipelineId}`
         );
 
     }

@@ -15,10 +15,11 @@ export class ImageFanoutService {
 
         const payload = { file, pipelineId };
 
-        AggregationService.initialize(
+       await AggregationService.initialize(
             pipelineId,
             4
         );
+
 
         await Promise.all([
             thumbnailQueue.add("thumbnail", payload),

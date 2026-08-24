@@ -14,8 +14,11 @@ export function errorMiddleware(
         });
     }
 
+    console.error("line 11", err);
     return res.status(500).json({
         success: false,
         message: "Internal Server Error",
     });
+
+
 }

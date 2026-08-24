@@ -11,8 +11,15 @@ export const metadataWorker = new Worker(
 
         await new Promise(resolve => setTimeout(resolve, 1500));
 
+        logger.info(
+            {
+                pipelineId: job.data.pipelineId,
+            },
+            "Worker received pipeline"
+        );
+
         const done =
-            AggregationService.complete(
+            await AggregationService.complete(
                 job.data.pipelineId
             );
 

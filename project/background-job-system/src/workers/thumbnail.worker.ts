@@ -13,14 +13,19 @@ export const thumbnailWorker = new Worker(
 
         logger.info("Thumbnail completed");
 
-        const done =
-            AggregationService.complete(
-                job.data.pipelineId,
-                
-            );
-            console.log("line 21", done)
+          logger.info(
+            {
+                pipelineId: job.data.pipelineId,
+            },
+            "Worker received pipeline"
+        );
 
-           
+        const done =
+            await AggregationService.complete(
+                job.data.pipelineId
+            );
+        console.log("line 21", done)
+
         if (done) {
 
             await aggregationQueue.add(
