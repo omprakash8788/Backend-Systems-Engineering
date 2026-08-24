@@ -1,6 +1,9 @@
 import { Worker } from "bullmq";
 import { redis } from "../config/redis.js";
 import { logger } from "../logger/index.js";
+import { AggregationService }
+    from "../services/aggregation.service.js";
+
 
 export const aggregationWorker =
     new Worker(
@@ -23,6 +26,10 @@ export const aggregationWorker =
 
                 "Publishing Image"
 
+            );
+
+            await AggregationService.remove(
+                job.data.pipelineId
             );
 
         },

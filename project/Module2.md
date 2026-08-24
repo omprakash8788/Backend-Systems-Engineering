@@ -7242,3 +7242,716 @@ You can now:
 ✅ Design services that enqueue work efficiently.
 
 ---
+
+### Fan-In Pattern (Many Jobs → One Final Aggregation)
+ - Prerequisites: Complete Module 2 – Lectures 1–11.
+
+---
+
+### What is Fan-In?
+
+In the previous lecture ***(Fan-Out)***:
+
+One request created many independent jobs
+
+```
+              Upload Image
+                    │
+     ┌──────────────┼──────────────┐
+     ▼              ▼              ▼
+ Thumbnail      Compression    Metadata
+```
+
+The problem is:
+
+- `How do we know when ALL jobs are finished?`
+
+That's where `Fan-In` comes in.
+
+Fan-In waits until `every child job finishes`, then starts `one final aggregation job.`
+
+---
+
+### Real Production Examples
+### YouTube
+```
+Upload Video
+
+        │
+
+────────┼──────────────
+
+480P
+
+720P
+
+1080P
+
+Thumbnail
+
+Subtitle
+
+        │
+
+        ▼
+
+Publish Video
+```
+
+Video is published `only after everything succeeds.`
+
+---
+
+### PDF Service
+```
+Generate Cover
+
+Generate TOC
+
+Generate Chapters
+
+Generate Appendix
+
+        │
+
+        ▼
+
+Merge PDF
+```
+
+---
+
+### AI Pipeline
+```
+Image Classification
+
+OCR
+
+Object Detection
+
+Face Detection
+
+        │
+
+        ▼
+
+Combine Results
+```
+
+---
+
+### Today's Goal
+
+We'll build
+```
+Upload Image
+
+        │
+
+────────┼─────────────┬───────────────┐
+
+Thumbnail
+
+Compression
+
+Metadata
+
+AI Tags
+
+        │
+
+────────┴─────────────┴───────────────┘
+
+        ▼
+
+Aggregation Queue
+
+        ▼
+
+Publish Image
+
+```
+
+---
+
+### Why Not Just Use FlowProducer?
+
+Good question.
+
+We `already learned FlowProducer.`
+
+Today we're learning the `business pattern`, not the BullMQ feature.
+
+Large companies often implement Fan-In manually because:
+
+- Jobs may run in different services.
+- Different languages.
+- Different data centers.
+- Kafka / RabbitMQ / SQS instead of BullMQ.
+
+The pattern is portable
+
+---
+
+### Folder Changes
+
+Create:
+```
+src/
+
+├── queues/
+│      aggregation.queue.ts
+│
+├── workers/
+│      aggregation.worker.ts
+│
+└── services/
+       aggregation.service.ts
+```
+
+---
+
+### Architecture
+
+```
+               Upload
+
+                  │
+
+       ImageFanoutService
+
+                  │
+
+──────────────────┼────────────────────
+
+Thumbnail
+
+Compression
+
+Metadata
+
+AI
+
+──────────────────┼────────────────────
+
+      Aggregation Service
+
+                  │
+
+        All Completed?
+
+             │
+
+      No ─────────► Wait
+
+             │
+
+            Yes
+
+             ▼
+
+Aggregation Queue
+
+             ▼
+
+Publish Image
+```
+
+---
+
+### Step 1 — Create Aggregation Queue
+### File
+```
+src/queues/aggregation.queue.ts
+```
+
+```
+import { Queue } from "bullmq";
+import { redis } from "../config/redis.js";
+
+export const aggregationQueue = new Queue(
+    "aggregation-queue",
+    {
+        connection: redis,
+    }
+);
+```
+
+---
+
+### Step 2 — Register Queue
+### File
+```
+src/services/queue-registry.service.ts
+```
+import:
+```
+import { aggregationQueue } from "../queues/aggregation.queue.js";
+```
+
+Register:
+```
+aggregation: aggregationQueue,
+```
+
+---
+
+### Step 3 — Give Every Upload a Pipeline ID
+
+Instead of
+```
+const payload = { file };
+```
+Update
+### File
+```
+src/services/image-fanout.service.ts
+```
+
+```
+import crypto from "node:crypto";
+
+const pipelineId = crypto.randomUUID();
+
+const payload = {
+
+    pipelineId,
+
+    file,
+
+};
+```
+
+Now every child job belongs to one upload.
+
+Example
+
+```
+Pipeline
+
+9db3ab1...
+
+Thumbnail
+
+Compression
+
+Metadata
+
+AI
+```
+
+---
+
+### Step 4 — Create Aggregation Service
+### File
+```
+src/services/aggregation.service.ts
+```
+```
+import { redis } from "../config/redis.js";
+
+export class AggregationService {
+
+    static async initialize(
+        pipelineId: string,
+        total: number
+    ) {
+
+        const key = `pipeline:${pipelineId}`;
+
+        await redis.hset(key, "total", total.toString());
+        await redis.hset(key, "completed", "0");
+
+        console.log(await redis.hgetall(key));
+    }
+
+    static async complete(
+        pipelineId: string
+    ): Promise<boolean> {
+
+        const key = `pipeline:${pipelineId}`;
+
+        const completed = await redis.hincrby(
+            key,
+            "completed",
+            1
+        );
+
+        const total = Number(
+            await redis.hget(
+                key,
+                "total"
+            )
+        );
+
+        console.log({
+            key,
+            completed,
+            total,
+        });
+
+        return completed === total;
+    }
+
+    static async remove(
+        pipelineId: string
+    ) {
+
+        await redis.del(
+            `pipeline:${pipelineId}`
+        );
+
+    }
+
+}
+```
+
+---
+
+### Why a Map?
+
+For learning.
+
+Production systems would store this in:
+
+- Redis
+- PostgreSQL
+- DynamoDB
+
+An in-memory `Map` is lost if the process restarts.
+
+We'll improve this in Module 3.
+
+---
+
+### Step 5 — Initialize Pipeline
+
+Back to
+```
+src/services/image-fanout.service.ts
+```
+Import
+```
+import { AggregationService } from "./aggregation.service.js";
+```
+
+Before adding jobs:
+```
+await AggregationService.initialize(
+    pipelineId,
+    4
+);
+```
+
+Now the service knows:
+```
+Pipeline
+
+Total Jobs = 4
+
+Completed = 0
+```
+
+---
+
+### Step 6 — Notify Aggregation Service
+
+Every worker must notify completion.
+
+---
+
+### File 
+```
+src/workers/thumbnail.worker.ts
+```
+
+import
+```
+import { AggregationService } from "../services/aggregation.service.js";
+import { aggregationQueue } from "../queues/aggregation.queue.js";
+```
+
+After processing
+```
+const done =
+   await AggregationService.complete(
+        job.data.pipelineId
+    );
+
+if (done) {
+
+    await aggregationQueue.add(
+
+        "publish-image",
+
+        {
+
+            pipelineId:
+                job.data.pipelineId,
+
+            file:
+                job.data.file,
+
+        }
+
+    );
+
+}
+```
+
+---
+
+### Step 7 — Update Remaining Workers
+
+Repeat the exact same logic in:
+```
+src/workers/compression.worker.ts
+```
+```
+src/workers/metadata.worker.ts
+```
+```
+src/workers/ai.worker.ts
+```
+
+Each worker must execute:
+```
+const done =
+   await AggregationService.complete(
+        job.data.pipelineId
+    );
+
+if (done) {
+
+    await aggregationQueue.add(
+
+        "publish-image",
+
+        {
+
+            pipelineId:
+                job.data.pipelineId,
+
+            file:
+                job.data.file,
+
+        }
+
+    );
+
+}
+```
+
+---
+
+### Step 8 — Create Aggregation Worker
+### File
+```
+src/workers/aggregation.worker.ts
+```
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+import { AggregationService }
+    from "../services/aggregation.service.js";
+
+
+export const aggregationWorker =
+    new Worker(
+
+        "aggregation-queue",
+
+        async (job) => {
+
+            logger.info(
+
+                {
+
+                    pipelineId:
+                        job.data.pipelineId,
+
+                    file:
+                        job.data.file,
+
+                },
+
+                "Publishing Image"
+
+            );
+
+            await AggregationService.remove(
+                job.data.pipelineId
+            );
+
+        },
+
+        {
+
+            connection: redis,
+
+        }
+
+    );
+```
+
+---
+
+### Note VVI
+```
+ service/image-fanout.service.ts
+```
+### Add
+```
+   await AggregationService.initialize(
+            pipelineId,
+            4
+        );
+
+```
+`We added await keyword`
+
+---
+
+### Step 9 — Register Worker
+### File
+```
+src/worker.ts
+```
+Add
+```
+import "./workers/aggregation.worker.js";
+```
+
+---
+
+### Restart
+
+Terminal 1
+```
+npm run dev
+```
+
+Terminal 2
+```
+npm run dev:worker
+```
+
+---
+
+### Testing
+
+### Test 1 — Upload Image
+```
+POST /api/v1/upload-image
+```
+Body
+```
+{
+    "file":"mountain.jpg"
+}
+```
+
+Expected response
+```
+{
+    "success":true,
+    "message":"Image processing started"
+}
+```
+
+---
+
+### Test 2 — Observe Logs
+
+Expected
+
+```
+Thumbnail Worker
+
+Compression Worker
+
+Metadata Worker
+
+AI Worker
+```
+
+These execute independently.
+
+After all finish:
+```
+Publishing Image
+```
+
+appears `once`.
+
+---
+
+### Test 3 — Simulate Failure
+
+Inside
+```
+src/workers/metadata.worker.ts
+```
+
+Temporarily add
+```
+throw new Error("Metadata failed");
+```
+
+Upload again.
+
+Expected
+```
+Thumbnail
+
+Completed
+
+Compression
+
+Completed
+
+AI
+
+Completed
+
+Metadata
+
+Failed
+```
+No
+```
+Publishing Image
+```
+
+should appear.
+
+Fan-In waits for `all` jobs to succeed.
+
+---
+
+### Test 4 — Restore Worker
+
+Remove the temporary error.
+
+Upload another image.
+
+Verify
+```
+Publishing Image
+```
+
+appears after all four workers complete.
+
+---
+
+### What You Learned
+
+You now know how to:
+
+- ✅ Implement the Fan-In pattern.
+- ✅ Coordinate multiple parallel jobs.
+- ✅ Trigger a final aggregation only after all work is complete.
+- ✅ Use a correlation (pipelineId) to group related jobs.
+
+---
