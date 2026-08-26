@@ -15,7 +15,7 @@ export const aggregationWorker =
             logger.info(
 
                 {
-
+                    jobName: job.name,
                     pipelineId:
                         job.data.pipelineId,
 
@@ -27,6 +27,12 @@ export const aggregationWorker =
                 "Publishing Image"
 
             );
+
+            // Lecture 12 (Manual Redis Fan-In)
+            if (job.data.pipelineId) {
+                await AggregationService.remove(job.data.pipelineId);
+            }
+
 
             await AggregationService.remove(
                 job.data.pipelineId
