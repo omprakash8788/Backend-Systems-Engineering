@@ -7242,7 +7242,7 @@ You can now:
 ✅ Design services that enqueue work efficiently.
 
 ---
-
+### Module 2 — Lecture 12
 ### Fan-In Pattern (Many Jobs → One Final Aggregation)
  - Prerequisites: Complete Module 2 – Lectures 1–11.
 
@@ -7955,3 +7955,412 @@ You now know how to:
 - ✅ Use a correlation (pipelineId) to group related jobs.
 
 ---
+
+---
+
+### Module 2 — Lecture 13
+### Parent–Child Jobs with BullMQ FlowProducer (Production Version)
+
+### Objective
+
+Currently you have `two orchestration methods:`
+
+### Method 1 (Lecture 12)
+```
+Upload
+    │
+    ▼
+Fan-Out
+    │
+Redis Counter
+    │
+Aggregation Queue
+```
+
+You built this manually.
+
+---
+
+### Method 2 (Lecture 13)
+
+We'll build:
+```
+Upload
+
+      │
+
+      ▼
+
+FlowProducer
+
+      │
+
+ ┌────┼────┐
+
+ ▼    ▼    ▼
+
+Thumbnail
+
+Metadata
+
+Compression
+
+AI
+
+      │
+
+      ▼
+
+BullMQ automatically releases
+
+Parent Job
+
+      │
+
+      ▼
+
+Publish Image
+```
+
+No Redis counters.
+
+No `AggregationService.`
+
+BullMQ manages dependencies.
+
+---
+
+### Before coding
+### We are editing, not creating:
+
+✅ Edit
+```
+src/services/flow.service.ts
+```
+
+✅ Edit
+```
+src/controllers/image.controller.ts
+```
+
+✅ Edit
+```
+src/routes/upload.routes.ts
+```
+✅ Reuse
+```
+thumbnail.worker.ts
+compression.worker.ts
+metadata.worker.ts
+ai.worker.ts
+aggregation.worker.ts
+```
+
+We are `not` creating duplicate workers or queues.
+
+---
+
+### Step 1
+
+First, I need to know what is already inside:
+```
+src/services/flow.service.ts
+```
+
+```
+import { flowProducer } from "../queues/flow.queue.js";
+
+export class FlowService {
+
+    static async process(file: string) {
+
+        await flowProducer.add({
+
+            name: "publish-image",
+
+            queueName: "aggregation-queue",
+
+            data: {
+
+                file,
+
+            },
+
+            children: [
+
+                {
+
+                    name: "thumbnail",
+
+                    queueName: "thumbnail-queue",
+
+                    data: { file },
+
+                },
+
+                {
+
+                    name: "compression",
+
+                    queueName: "compression-queue",
+
+                    data: { file },
+
+                },
+
+                {
+
+                    name: "metadata",
+
+                    queueName: "metadata-queue",
+
+                    data: { file },
+
+                },
+
+                {
+
+                    name: "ai-tagging",
+
+                    queueName: "ai-queue",
+
+                    data: { file },
+
+                },
+
+            ],
+
+        });
+
+    }
+
+}
+```
+
+`src/queues/flow.queue.ts`
+```
+import {FlowProducer} from 'bullmq';
+
+import { redis } from "../config/redis.js";
+
+export const flowProducer =
+    new FlowProducer({
+
+        connection: redis,
+
+    });
+
+    
+```
+
+### Goal
+
+Integrate FlowProducer into your existing project.
+
+We only edit existing files.
+
+---
+
+```
+Step 1 — Edit src/controllers/image.controller.ts
+```
+open:
+```
+src/controllers/image.controller.ts
+```
+
+If you already have an upload endpoint, `add` this new controller below it.
+
+```
+import { Request, Response } from "express";
+import { FlowService } from "../services/flow.service.js";
+
+export async function uploadImageFlow(
+    req: Request,
+    res: Response
+) {
+    const { file } = req.body;
+
+    if (!file) {
+        return res.status(400).json({
+            success: false,
+            message: "file is required",
+        });
+    }
+
+    await FlowService.process(file);
+
+    return res.status(200).json({
+        success: true,
+        message: "Flow started successfully",
+    });
+}
+```
+
+---
+
+### Step 2 — Edit src/routes/upload.routes.ts
+
+Add the import:
+```
+import { uploadImageFlow } from "../controllers/image.controller.js";
+```
+
+Then add a new route:
+```
+
+router.post(
+    "/upload-image-flow",
+    uploadImageFlow
+);
+
+```
+
+Now you have:
+
+```
+POST /api/v1/upload-image
+```
+
+(old Redis Fan-In implementation)
+
+and
+
+```
+POST /api/v1/upload-image-flow
+```
+
+(new FlowProducer implementation)
+
+Both exist so you can compare them.
+
+---
+
+### Step 3 — Aggregation Worker
+
+Open
+```
+src/workers/aggregation.worker.ts
+
+```
+
+Replace it with:
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+import { AggregationService } from "../services/aggregation.service.js";
+
+export const aggregationWorker = new Worker(
+    "aggregation-queue",
+
+    async (job) => {
+
+        logger.info(
+            {
+                jobName: job.name,
+                pipelineId: job.data.pipelineId,
+                file: job.data.file,
+            },
+            "Publishing Image"
+        );
+
+        // Lecture 12 (Manual Redis Fan-In)
+        if (job.data.pipelineId) {
+            await AggregationService.remove(job.data.pipelineId);
+        }
+
+        // Lecture 13 (FlowProducer)
+        // No cleanup needed because BullMQ manages dependencies.
+
+    },
+
+    {
+        connection: redis,
+    }
+);
+```
+
+### Before testing, ensure these are running:
+
+### Terminal 1
+```
+npm run dev
+```
+
+---
+
+### Terminal 2
+```
+npm run dev:worker
+```
+
+### Test 1 — Create a Flow
+### Request
+
+```
+POST /api/v1/upload-image-flow
+```
+
+Body
+```
+{
+    "file": "beach.jpg"
+}
+```
+
+Expected response:
+```
+{
+    "success": true,
+    "message": "Flow started successfully"
+}
+```
+
+
+If you get this response, stop and check the worker terminal.
+
+---
+
+### Test 2 — Child Jobs Execute
+
+Expected logs:
+```
+Generating thumbnail
+Compressing image
+Extracting metadata
+Running AI tagging
+```
+
+Notice:
+
+There should NOT be:
+```
+Publishing Image
+```
+until `all four` child jobs finish.
+
+---
+
+### Test 3 — Parent Job Executes
+
+After the last child finishes:
+```
+Thumbnail completed
+Compression completed
+Metadata extracted
+AI tagging completed
+```
+
+Then:
+```
+Publishing Image
+```
+
+should appear exactly` once`.
+
+---
+
+
+
+
