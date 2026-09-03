@@ -7,9 +7,42 @@ import { aggregationQueue } from "../queues/aggregation.queue.js";
 export const aiWorker = new Worker(
     "ai-queue",
     async (job) => {
-        logger.info({ file: job.data.file }, "Running AI tagging");
+        logger.info({ file: job.data.file }, "AI Worker");
 
-        await new Promise(resolve => setTimeout(resolve, 4000));
+             switch (job.name) {
+
+            case "generate-caption":
+
+                logger.info("Generating caption...");
+                break;
+
+            case "detect-objects":
+
+                logger.info("Detecting objects...");
+                break;
+
+            case "generate-embeddings":
+
+                logger.info("Generating embeddings...");
+                break;
+
+            case "ai-processing":
+
+                logger.info("Final AI processing completed.");
+                break;
+
+            default:
+
+                logger.warn(
+                    {
+                        jobName: job.name,
+                    },
+                    "Unknown AI Job"
+                );
+
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 1500));
 
         logger.info(
             {
@@ -47,6 +80,6 @@ export const aiWorker = new Worker(
     },
     {
         connection: redis,
-        concurrency: 1,
+        concurrency: 2,
     }
 );

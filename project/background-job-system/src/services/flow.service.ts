@@ -48,13 +48,41 @@ export class FlowService {
 
                 },
 
-                {
+                // {
 
-                    name: "ai-tagging",
+                //     name: "ai-tagging",
+
+                //     queueName: "ai-queue",
+
+                //     data: { file },
+
+                // },
+
+                      {
+
+                    name: "ai-processing",
 
                     queueName: "ai-queue",
 
                     data: { file },
+                    children:[
+                         {
+                            name: "generate-caption",
+                            queueName: "ai-queue",
+                            data: { file },
+                        },
+                           {
+                            name: "detect-objects",
+                            queueName: "ai-queue",
+                            data: { file },
+                        },
+
+                        {
+                            name: "generate-embeddings",
+                            queueName: "ai-queue",
+                            data: { file },
+                        }
+                    ]
 
                 },
 
