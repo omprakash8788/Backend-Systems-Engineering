@@ -8363,6 +8363,396 @@ should appear exactly` once`.
 
 ---
 
+### Module 2 — Lecture 14
+### Nested Flows & Multi-Level Pipelines
 
+`Difficulty`: ⭐⭐⭐⭐☆
 
+`Real-world usage:` ***Extremely High***
+
+Companies like Google, Netflix, Adobe, Canva, and GitHub Actions build workflows that are ***more than one level deep.***
+
+---
+
+### What you'll learn
+
+Until now, we've built:
+
+```
+Upload Image
+      │
+      ▼
+ ┌────┼────┐
+ │    │    │
+ ▼    ▼    ▼
+Thumbnail
+Metadata
+Compression
+AI
+      │
+      ▼
+Publish Image
+```
+
+Now we'll build:
+```
+Upload Image
+      │
+      ▼
+Process Image (Parent)
+
+      │
+      ├──────────────┬──────────────────┐
+      ▼              ▼                  ▼
+
+Thumbnail        Compression      AI Analysis
+
+                                      │
+                                      ▼
+
+                           Generate Caption
+
+                                      │
+                                      ▼
+
+                           Detect Objects
+
+                                      │
+                                      ▼
+
+                           Generate Embeddings
+
+      └───────────────────────────────────────┐
+                                              ▼
+                                      Publish Image
+```
+
+Notice:
+
+AI itself has its own workflow.
+
+This is called a ***Nested Flow.***
+
+---
+
+### Real-world Example
+
+Imagine uploading a photo to Google Photos.
+
+```
+Upload
+
+↓
+
+Resize
+
+↓
+
+AI Processing
+
+        ↓
+
+Face Detection
+
+↓
+
+OCR
+
+↓
+
+Caption
+
+↓
+
+Embeddings
+
+↓
+
+Search Index
+
+↓
+
+Publish
+```
+
+BullMQ can model this entire graph.
+
+---
+
+### Project Changes
+### Files Created
+```
+None
+```
+
+---
+
+### Files Modified
+```
+src/services/flow.service.ts
+```
+
+---
+
+### Files Reused
+
+```
+src/workers/ai.worker.ts
+
+src/workers/aggregation.worker.ts
+```
+
+---
+
+### Step 1 — Update FlowService
+### File
+```
+src/services/flow.service.ts
+```
+
+Replace the `children` array with this nested version:
+
+```
+import { flowProducer } from "../queues/flow.queue.js";
+
+export class FlowService {
+
+    static async process(file: string) {
+
+        await flowProducer.add({
+
+            name: "publish-image",
+
+            queueName: "aggregation-queue",
+
+            data: { file },
+
+            children: [
+
+                {
+                    name: "thumbnail",
+                    queueName: "thumbnail-queue",
+                    data: { file },
+                },
+
+                {
+                    name: "compression",
+                    queueName: "compression-queue",
+                    data: { file },
+                },
+
+                {
+                    name: "metadata",
+                    queueName: "metadata-queue",
+                    data: { file },
+                },
+
+                {
+                    name: "ai-processing",
+                    queueName: "ai-queue",
+                    data: { file },
+
+                    children: [
+
+                        {
+                            name: "generate-caption",
+                            queueName: "ai-queue",
+                            data: { file },
+                        },
+
+                        {
+                            name: "detect-objects",
+                            queueName: "ai-queue",
+                            data: { file },
+                        },
+
+                        {
+                            name: "generate-embeddings",
+                            queueName: "ai-queue",
+                            data: { file },
+                        }
+
+                    ]
+
+                }
+
+            ]
+
+        });
+
+    }
+
+}
+```
+
+---
+
+### Step 2 — Update AI Worker
+### File
+```
+src/workers/ai.worker.ts
+```
+
+Replace your processor with:
+
+```
+import { Worker } from "bullmq";
+import { redis } from "../config/redis.js";
+import { logger } from "../logger/index.js";
+
+export const aiWorker = new Worker(
+
+    "ai-queue",
+
+    async (job) => {
+
+        logger.info(
+            {
+                jobName: job.name,
+                file: job.data.file,
+            },
+            "AI Worker"
+        );
+
+        switch (job.name) {
+
+            case "generate-caption":
+
+                logger.info("Generating caption...");
+                break;
+
+            case "detect-objects":
+
+                logger.info("Detecting objects...");
+                break;
+
+            case "generate-embeddings":
+
+                logger.info("Generating embeddings...");
+                break;
+
+            case "ai-processing":
+
+                logger.info("Final AI processing completed.");
+                break;
+
+            default:
+
+                logger.warn(
+                    {
+                        jobName: job.name,
+                    },
+                    "Unknown AI Job"
+                );
+
+        }
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1500)
+        );
+
+    },
+
+    {
+        connection: redis,
+        concurrency: 2,
+    }
+
+);
+```
+
+---
+
+### What happens?
+
+BullMQ creates this dependency graph:
+```
+Publish Image
+│
+├── Thumbnail
+├── Compression
+├── Metadata
+└── AI Processing
+      │
+      ├── Generate Caption
+      ├── Detect Objects
+      └── Generate Embeddings
+```
+
+The execution order becomes:
+```
+Generate Caption
+Detect Objects
+Generate Embeddings
+
+↓
+
+AI Processing
+
+↓
+
+Publish Image
+```
+
+Notice:
+
+The parent AI job waits for its three children.
+
+The Publish Image job waits for everything.
+
+---
+
+### Test
+### Request
+```
+POST /api/v1/upload-image-flow
+```
+
+Body
+```
+{
+    "file": "beach.jpg"
+}
+```
+
+---
+
+### Expected Logs
+```
+Generating thumbnail
+
+Compressing image
+
+Extracting metadata
+
+Generating caption...
+
+Detecting objects...
+
+Generating embeddings...
+
+Final AI processing completed.
+
+Publishing Image
+```
+
+---
+
+### Verify
+
+Observe the order carefully.
+
+The log:
+```
+Final AI processing completed.
+```
+
+must appear `before`:
+```
+Publishing Image
+```
+
+If it does, nested dependencies are working correctly.
+
+---
 
