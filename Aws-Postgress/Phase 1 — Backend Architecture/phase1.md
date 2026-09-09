@@ -1,6 +1,9 @@
 ### Phase 1 — Backend Architecture
 Goal
 
+### Phase 1 — Backend Architecture
+Goal
+
 By the end of this phase, you should be able to answer questions like:
 
 - How does Google.com open in my browser?
