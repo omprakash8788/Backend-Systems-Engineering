@@ -8756,3 +8756,693 @@ If it does, nested dependencies are working correctly.
 
 ---
 
+
+### Module 2, Lecture 15
+### Dynamic Flow Generation
+
+We are continuing directly from `Lecture 14.`
+
+
+This lecture is about making the FlowProducer workflow `dynamic at runtime` instead of hard-coding the same children every time.
+
+For example:
+
+```
+Basic user
+   ↓
+Thumbnail
+Compression
+Metadata
+
+Premium user
+   ↓
+Thumbnail
+Compression
+Metadata
+AI Caption
+Object Detection
+Embeddings
+```
+
+The flow is decided by the request/business rules
+
+---
+
+### 1. What changes in this lecture?
+
+We will` not create any new files.`
+
+### Modify
+```
+src/services/flow.service.ts
+```
+
+### Keep using
+```
+src/queues/flow.queue.ts
+src/controllers/image.controller.ts
+src/routes/upload.routes.ts
+src/workers/thumbnail.worker.ts
+src/workers/compression.worker.ts
+src/workers/metadata.worker.ts
+src/workers/ai.worker.ts
+src/workers/aggregation.worker.ts
+```
+
+---
+
+### 2. Current problem
+
+Your current `flow.service.ts` has a fixed structure:
+
+```
+children: [
+    thumbnail,
+    compression,
+    metadata,
+    ai-processing
+]
+```
+
+That means every request gets exactly the same workflow.
+
+Production systems usually don't work like that
+
+We want:
+```
+Request
+   │
+   ├── file
+   ├── premium
+   └── options
+          │
+          ▼
+   Build workflow dynamically
+```
+
+---
+
+### 3. Update src/services/flow.service.ts
+Replace the current *** process()*** implementation with:
+```
+import { flowProducer } from "../queues/flow.queue.js";
+
+type FlowOptions = {
+    enableAI?: boolean;
+    enableCaption?: boolean;
+    enableObjects?: boolean;
+    enableEmbeddings?: boolean;
+};
+
+export class FlowService {
+
+    static async process(
+        file: string,
+        options: FlowOptions = {}
+    ) {
+
+        const {
+            enableAI = false,
+            enableCaption = false,
+            enableObjects = false,
+            enableEmbeddings = false,
+        } = options;
+
+        const children: any[] = [];
+
+        // --------------------------------
+        // Basic image processing
+        // --------------------------------
+
+        children.push({
+
+            name: "thumbnail",
+
+            queueName: "thumbnail-queue",
+
+            data: {
+                file,
+            },
+
+        });
+
+        children.push({
+
+            name: "compression",
+
+            queueName: "compression-queue",
+
+            data: {
+                file,
+            },
+
+        });
+
+        children.push({
+
+            name: "metadata",
+
+            queueName: "metadata-queue",
+
+            data: {
+                file,
+            },
+
+        });
+
+        // --------------------------------
+        // Dynamic AI processing
+        // --------------------------------
+
+        if (enableAI) {
+
+            const aiChildren: any[] = [];
+
+            if (enableCaption) {
+
+                aiChildren.push({
+
+                    name: "generate-caption",
+
+                    queueName: "ai-queue",
+
+                    data: {
+                        file,
+                    },
+
+                });
+
+            }
+
+            if (enableObjects) {
+
+                aiChildren.push({
+
+                    name: "detect-objects",
+
+                    queueName: "ai-queue",
+
+                    data: {
+                        file,
+                    },
+
+                });
+
+            }
+
+            if (enableEmbeddings) {
+
+                aiChildren.push({
+
+                    name: "generate-embeddings",
+
+                    queueName: "ai-queue",
+
+                    data: {
+                        file,
+                    },
+
+                });
+
+            }
+
+            // Only create AI parent
+            // if there is AI work.
+
+            if (aiChildren.length > 0) {
+
+                children.push({
+
+                    name: "ai-processing",
+
+                    queueName: "ai-queue",
+
+                    data: {
+                        file,
+                    },
+
+                    children: aiChildren,
+
+                });
+
+            }
+
+        }
+
+        // --------------------------------
+        // Create complete flow
+        // --------------------------------
+
+        const flow = await flowProducer.add({
+
+            name: "publish-image",
+
+            queueName: "aggregation-queue",
+
+            data: {
+                file,
+            },
+
+            children,
+
+        });
+
+        return flow;
+    }
+
+}
+```
+
+---
+
+### 4. Why are we building children first?
+
+This is the important concept.
+
+Instead of:
+```
+flowProducer.add({
+    children: [...]
+});
+```
+
+We first construct:
+```
+const children = [];
+```
+
+Then business rules decide what goes inside.
+
+For example:
+```
+enableAI = false
+```
+
+produces:
+```
+Publish
+│
+├── Thumbnail
+├── Compression
+└── Metadata
+```
+
+But:
+```
+enableAI = true
+enableCaption = true
+enableObjects = true
+enableEmbeddings = true
+```
+
+produces:
+```
+Publish
+│
+├── Thumbnail
+├── Compression
+├── Metadata
+│
+└── AI Processing
+       │
+       ├── Caption
+       ├── Objects
+       └── Embeddings
+```
+
+---
+
+### 5. Update Controller
+
+Now we need to send these options from the API.
+
+### File
+```
+src/controllers/image.controller.ts
+```
+Find your `uploadImageFlow()` function.
+
+Update it to:
+
+```
+import { Request, Response } from "express";
+
+import { FlowService }
+    from "../services/flow.service.js";
+
+export async function uploadImageFlow(
+    req: Request,
+    res: Response
+) {
+
+    const {
+        file,
+        enableAI = false,
+        enableCaption = false,
+        enableObjects = false,
+        enableEmbeddings = false,
+    } = req.body;
+
+    if (
+        typeof file !== "string" ||
+        file.trim() === ""
+    ) {
+
+        return res.status(400).json({
+
+            success: false,
+
+            message: "file is required",
+
+        });
+
+    }
+
+    const flow =
+        await FlowService.process(
+
+            file,
+
+            {
+                enableAI,
+                enableCaption,
+                enableObjects,
+                enableEmbeddings,
+            }
+
+        );
+
+    return res.status(200).json({
+
+        success: true,
+
+        message: "Dynamic flow created",
+
+        jobId: flow.job.id,
+
+    });
+
+}
+```
+
+---
+
+### 6. Important validation
+
+Right now we're accepting:
+```
+{
+    "enableAI": "hello"
+}
+```
+
+which is not good.
+
+For this lecture, let's add a small validation helper.
+
+Inside the controller, before calling the service:
+
+```
+const options = [
+    enableAI,
+    enableCaption,
+    enableObjects,
+    enableEmbeddings,
+];
+
+if (options.some(value => typeof value !== "boolean")) {
+
+    return res.status(400).json({
+
+        success: false,
+
+        message:
+            "AI options must be boolean values",
+
+    });
+
+}
+```
+
+So the controller becomes:
+
+```
+export async function uploadImageFlow(
+    req: Request,
+    res: Response
+) {
+
+    const {
+        file,
+        enableAI = false,
+        enableCaption = false,
+        enableObjects = false,
+        enableEmbeddings = false,
+    } = req.body;
+
+    if (
+        typeof file !== "string" ||
+        file.trim() === ""
+    ) {
+
+        return res.status(400).json({
+
+            success: false,
+
+            message: "file is required",
+
+        });
+
+    }
+
+    const options = [
+        enableAI,
+        enableCaption,
+        enableObjects,
+        enableEmbeddings,
+    ];
+
+    if (
+        options.some(
+            value => typeof value !== "boolean"
+        )
+    ) {
+
+        return res.status(400).json({
+
+            success: false,
+
+            message:
+                "AI options must be boolean values",
+
+        });
+
+    }
+
+    const flow =
+        await FlowService.process(
+
+            file,
+
+            {
+                enableAI,
+                enableCaption,
+                enableObjects,
+                enableEmbeddings,
+            }
+
+        );
+
+    return res.status(200).json({
+
+        success: true,
+
+        message: "Dynamic flow created",
+
+        jobId: flow.job.id,
+
+    });
+
+}
+```
+
+---
+
+### 7. Test 1 — Basic Flow
+
+Restart your API and worker.
+
+Send:
+```
+POST /api/v1/upload-image-flow
+```
+
+Body
+```
+{
+    "file": "beach.jpg"
+}
+```
+
+Because all AI options default to `false`, the flow becomes:
+
+```
+Publish Image
+│
+├── Thumbnail
+├── Compression
+└── Metadata
+```
+
+Expected:
+```
+Generating thumbnail
+Compressing image
+Extracting metadata
+
+Thumbnail completed
+Compression completed
+Metadata extracted
+
+Publishing Image
+```
+
+There should be no:
+```
+Generating caption
+Detecting objects
+Generating embeddings
+```
+
+---
+
+
+### 8. Test 2 — Enable AI
+
+Now send:
+```
+{
+    "file": "beach.jpg",
+    "enableAI": true,
+    "enableCaption": true,
+    "enableObjects": true,
+    "enableEmbeddings": true
+}
+```
+
+The generated flow becomes:
+```
+                    Publish
+                       │
+       ┌───────────────┼───────────────┐
+       │               │               │
+   Thumbnail       Compression      Metadata
+                                      
+
+                       │
+                       ▼
+                 AI Processing
+                       │
+             ┌─────────┼─────────┐
+             ▼         ▼         ▼
+          Caption   Objects   Embeddings
+```
+
+Expected AI logs:
+```
+Generating caption...
+Detecting objects...
+Generating embeddings...
+
+Final AI processing completed.
+
+Publishing Image
+```
+
+---
+
+### 9. Test 3 — Only Caption
+
+Send:
+```
+{
+    "file": "cat.jpg",
+    "enableAI": true,
+    "enableCaption": true
+}
+```
+
+Expected AI workflow:
+```
+AI Processing
+      │
+      ▼
+Generate Caption
+```
+
+There should be `no`:
+```
+Detecting objects
+Generating embeddings
+```
+
+---
+
+### 10. Test 4 — AI enabled but no AI tasks
+
+Send:
+```
+{
+    "file": "car.jpg",
+    "enableAI": true
+}
+```
+
+This is an important edge case.
+
+Since:
+```
+aiChildren.length === 0
+
+```
+
+we don't create the `ai-processing` parent.
+
+The flow is simply:
+```
+Publish
+│
+├── Thumbnail
+├── Compression
+└── Metadata
+```
+
+This is better than creating an unnecessary empty workflow.
+
+---
+
+### 11. Test 5 — Invalid Input
+
+Send
+```
+{
+    "file": "beach.jpg",
+    "enableAI": "yes"
+}
+```
+
+Expected:
+```
+{
+    "success": false,
+    "message": "AI options must be boolean values"
+}
+```
+
+No BullMQ flow should be created.
+
+---
+
+
+
+
