@@ -9444,5 +9444,653 @@ No BullMQ flow should be created.
 ---
 
 
+### Module 2 — Production Queue Patterns
+### Lecture 16 — Batch Jobs & Bulk Enqueue
+
+This lecture introduces an important production pattern:
+
+`How do we enqueue 1,000 / 10,000 / 100,000 jobs efficiently without calling `queue.add()` 10,000 times?`
+
+BullMQ provides` Queue.addBulk()` specifically for this. It can reduce Redis round trips and the bulk operation is atomic: the jobs are either all added or none are added.
+
+---
+
+### 1. First understand the problem
+
+Suppose we need to send emails to 10,000 users.
+
+Naive approach
+```
+for (const user of users) {
+    await emailQueue.add(
+        "send-email",
+        {
+            email: user.email
+        }
+    );
+}
+```
+
+This means:
+```
+Request
+   │
+   ├── Redis → add job
+   ├── Redis → add job
+   ├── Redis → add job
+   ├── Redis → add job
+   ├── ...
+   └── Redis → add job
+```
+
+That's a lot of individual Redis operations
+
+---
+
+### 2. Bulk enqueue
+Instead:
+```
+await emailQueue.addBulk([
+    {
+        name: "send-email",
+        data: {
+            email: "user1@example.com"
+        }
+    },
+    {
+        name: "send-email",
+        data: {
+            email: "user2@example.com"
+        }
+    },
+    {
+        name: "send-email",
+        data: {
+            email: "user3@example.com"
+        }
+    }
+]);
+```
+
+Conceptually:
+```
+                ┌── Job 1
+                ├── Job 2
+Request ────────┼── Job 3
+                ├── Job 4
+                └── Job 5
+                       │
+                       ▼
+                    Redis
+                       │
+              ┌────────┼────────┐
+              ▼        ▼        ▼
+           Worker   Worker   Worker
+```
+
+
+Each item is still an `independent BullMQ job.`
+
+That means each job can have its own:
+
+- retry
+- failure
+- completion
+- job ID
+- event
+- processing lifecycle
+
+This distinction is extremely important
+
+---
+
+### 3. Batch vs Bulk
+
+These two terms sound similar but mean different things.
+
+### Bulk enqueue
+```
+10,000 independent jobs
+        ↓
+     addBulk()
+        ↓
+10,000 independent jobs
+```
+
+Use this when every item should be independently processed.
+### Single batch job
+
+```
+1 job
+ │
+ ├── item 1
+ ├── item 2
+ ├── item 3
+ └── item 4
+```
+
+Example:
+```
+await emailQueue.add("send-batch", {
+    emails: [
+        "a@example.com",
+        "b@example.com",
+        "c@example.com"
+    ]
+});
+```
+
+Now the worker receives `one job.`
+
+If you need independent retries and failure tracking, prefer addBulk(). If the whole group should have one retry/completion outcome, a single batch job may be more appropriate.
+
+---
+
+### 4. What we will build
+
+We already have these files in your project:
+
+```
+src/
+├── controllers/
+│   └── bulk.controller.ts
+│
+├── routes/
+│   └── bulk.routes.ts
+│
+├── services/
+│   └── bulk.service.ts
+│
+└── queues/
+    └── email.queue.ts
+```
+
+### Files
+
+| File                                 | Action                  |
+| ------------------------------------ | ----------------------- |
+| `src/services/bulk.service.ts`       | **EDIT**                |
+| `src/controllers/bulk.controller.ts` | **EDIT**                |
+| `src/routes/bulk.routes.ts`          | **EDIT**                |
+| `src/queues/email.queue.ts`          | **UNCHANGED**           |
+| `src/workers/email.worker.ts`        | **UNCHANGED initially** |
+| New files                            | **NONE**                |
+
+
+***Important:*** Do not delete your existing methods from these files. Add the Lecture 16 functionality alongside the existing functionality.
+
+---
+
+### 5. Service — Bulk enqueue
+
+Open:
+```
+src/services/bulk.service.ts
+```
+
+Add a new method to your existing service:
+```
+import { emailQueue } from "../queues/email.queue.js";
+
+export class BulkService {
+
+    static async enqueueEmails(
+        emails: string[]
+    ) {
+
+        const jobs = emails.map((email) => ({
+            name: "send-email",
+            data: {
+                email
+            }
+        }));
+
+        const createdJobs =
+            await emailQueue.addBulk(jobs);
+
+        return createdJobs;
+    }
+}
+```
+
+The important part is:
+
+```
+await emailQueue.addBulk(jobs);
+```
+
+Instead of:
+```
+await emailQueue.add(...);
+await emailQueue.add(...);
+await emailQueue.add(...);
+```
+
+---
+
+### 6. Why map()?
+
+Suppose the API receives:
+```
+{
+    "emails": [
+        "rahul@example.com",
+        "amit@example.com",
+        "priya@example.com"
+    ]
+}
+```
+
+We transorm it:
+```
+const jobs = emails.map((email) => ({
+    name: "send-email",
+    data: {
+        email
+    }
+}));
+```
+
+Result:
+```
+[
+    {
+        name: "send-email",
+        data: {
+            email: "rahul@example.com"
+        }
+    },
+    {
+        name: "send-email",
+        data: {
+            email: "amit@example.com"
+        }
+    },
+    {
+        name: "send-email",
+        data: {
+            email: "priya@example.com"
+        }
+    }
+]
+```
+
+Then
+```
+emailQueue.addBulk(jobs);
+```
+
+---
+
+### 7. Controller
+
+Open:
+```
+src/controllers/bulk.controller.ts
+```
+Add:
+```
+import { Request, Response } from "express";
+import { BulkService } from "../services/bulk.service.js";
+
+export async function enqueueBulkEmails(
+    req: Request,
+    res: Response
+) {
+    const { emails } = req.body;
+
+    if (!Array.isArray(emails)) {
+        return res.status(400).json({
+            success: false,
+            message: "emails must be an array"
+        });
+    }
+
+    if (emails.length === 0) {
+        return res.status(400).json({
+            success: false,
+            message: "emails cannot be empty"
+        });
+    }
+
+    if (emails.length > 1000) {
+        return res.status(400).json({
+            success: false,
+            message: "Maximum 1000 emails per request"
+        });
+    }
+
+    if (
+        emails.some(
+            (email) =>
+                typeof email !== "string" ||
+                email.trim() === ""
+        )
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Every email must be a non-empty string"
+        });
+    }
+
+    const jobs =
+        await BulkService.enqueueEmails(emails);
+
+    return res.status(202).json({
+        success: true,
+        message: "Bulk jobs enqueued",
+        count: jobs.length,
+        jobIds: jobs.map((job) => job.id)
+    });
+}
+```
+
+Notice that we deliberately put a limit:
+```
+if (emails.length > 1000)
+```
+
+We don't want a client to send:
+```
+{
+    "emails": [
+        "...",
+        "...",
+        "... 500,000 items ..."
+    ]
+}
+```
+
+That is an API protection mechanism.
+
+---
+
+### 8. Route
+
+Open:
+```
+src/routes/bulk.routes.ts
+```
+
+Add the route using your existing router:
+```
+import { Router } from "express";
+import {
+    enqueueBulkEmails
+} from "../controllers/bulk.controller.js";
+
+const router = Router();
+
+router.post(
+    "/emails",
+    enqueueBulkEmails
+);
+
+export default router;
+```
+
+### Important
+
+If your `bulk.routes.ts` already contains:
+```
+const router = Router();
+```
+
+or an existing default export, `do not create another router.`
+
+Add only:
+```
+router.post(
+    "/emails",
+    enqueueBulkEmails
+);
+```
+
+And add the controller import.
+
+
+---
+
+### 9. API
+
+Assuming your existing app.ts mounts:
+```
+app.use("/api/v1/bulk", bulkRoutes);
+```
+
+the endpoint becomes:
+
+```
+POST /api/v1/bulk/emails
+```
+
+Request:
+```
+{
+    "emails": [
+        "rahul@example.com",
+        "amit@example.com",
+        "priya@example.com",
+        "neha@example.com"
+    ]
+}
+```
+
+Expected response:
+```
+{
+    "success": true,
+    "message": "Bulk jobs enqueued",
+    "count": 4,
+    "jobIds": [
+        "101",
+        "102",
+        "103",
+        "104"
+    ]
+}
+```
+
+The exact IDs will obviously be different.
+
+---
+
+### 10. Test 1 — One email
+
+Send:
+```
+{
+    "emails": [
+        "rahul@example.com"
+    ]
+}
+```
+Expected:
+```
+count = 1
+```
+Worker should process one job.
+
+---
+
+### 11. Test 2 — Five jobs
+
+Send:
+```
+{
+    "emails": [
+        "rahul@example.com",
+        "amit@example.com",
+        "priya@example.com",
+        "neha@example.com",
+        "arjun@example.com"
+    ]
+}
+```
+
+You should see:
+```
+Bulk jobs enqueued
+        ↓
+5 BullMQ jobs
+        ↓
+email worker
+        ↓
+job 1
+job 2
+job 3
+job 4
+job 5
+```
+
+---
+
+### 12. Test 3 — Empty array
+
+Request:
+```
+{
+    "emails": []
+}
+```
+
+Expected:
+```
+
+400
+
+```
+
+Response:
+```
+
+{
+    "success": false,
+    "message": "emails cannot be empty"
+}
+```
+
+---
+
+### 13. Test 4 — Invalid data
+
+Request:
+```
+
+{
+    "emails": "rahul@example.com"
+}
+```
+
+Expected:
+```
+400
+```
+
+because:
+
+```
+Array.isArray(emails)
+
+```
+
+is `false.`
+
+---
+
+
+### 16. Very important production concept
+
+`addBulk()` does `not` mean the worker processes all jobs together.
+
+For example:
+```
+await emailQueue.addBulk([
+    job1,
+    job2,
+    job3,
+    job4
+]);
+```
+
+Redis contains:
+
+```
+job1
+job2
+job3
+job4
+```
+
+Your worker still receives:
+```
+async (job) => {
+    // one job
+}
+
+```
+
+not:
+```
+async (jobs) => {
+    // four jobs
+}
+```
+
+BullMQ's open-source worker processes individual jobs. Worker concurrency is also different from native batch processing.
+
+
+---
+
+### 17. Atomicity
+
+This is one of the most important properties.
+
+Suppose we call:
+```
+await emailQueue.addBulk([
+    job1,
+    job2,
+    job3,
+    job4
+]);
+```
+
+The bulk enqueue operation is atomic:
+```
+SUCCESS
+   ↓
+job1 ✓
+job2 ✓
+job3 ✓
+job4 ✓
+```
+
+or:
+```
+FAILURE
+   ↓
+job1 ✗
+job2 ✗
+job3 ✗
+job4 ✗
+```
+
+You don't get a half-created bulk operation from `addBulk()` itself.
+
+`But this does NOT mean the jobs will all succeed.`
+
+After enqueueing:
+```
+job1 → completed
+job2 → completed
+job3 → failed
+job4 → completed
+```
+
+That's normal because processing happens independently.
+
+---
+
 
 

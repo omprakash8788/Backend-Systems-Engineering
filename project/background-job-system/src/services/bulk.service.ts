@@ -6,6 +6,12 @@ export class BulkService {
         emails: string[]
     ) {
 
+        if (emails.length > 1000) {
+            throw new Error(
+                "Maximum 1000 emails are allowed per batch."
+            );
+        }
+
         const uniqueEmails = [...new Set(emails)];
 
         const counts = await emailQueue.getJobCounts(

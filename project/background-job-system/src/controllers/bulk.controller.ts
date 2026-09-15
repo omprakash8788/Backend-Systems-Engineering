@@ -9,6 +9,7 @@ export async function bulkEmail(
 
     const { emails } = req.body;
 
+
     if (emails.length > 1000) {
 
         throw new AppError(
@@ -34,6 +35,19 @@ export async function bulkEmail(
         );
     }
 
+    if (
+        emails.some(
+            (email) =>
+                typeof email !== "string" ||
+                email.trim() === ""
+        )
+    ) {
+        return res.status(400).json({
+            success: false,
+            message: "Every email must be a non-empty string"
+        });
+    }
+
     const jobs = await BulkService.queueEmails(
         emails
     );
@@ -41,6 +55,7 @@ export async function bulkEmail(
     return res.status(202).json({
 
         success: true,
+        message: "Bulk jobs enqueued",
 
         total: jobs.length,
 
