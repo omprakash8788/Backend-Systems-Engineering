@@ -16,6 +16,7 @@ import queueRoutes from "./routes/queue.routes.js";
 
 import demoRoutes from "./routes/demo.routes.js";
 import uploadRoutes from "./routes/upload.routes.js";
+import { DistributedLockService } from "./services/distributed-lock.service.js";
 
 
 
@@ -49,6 +50,14 @@ app.use((req, res) => {
   });
 });
 
+
+const token =
+    await DistributedLockService.acquire(
+        "account:1001",
+        10000
+    );
+
+console.log("line 60",token);
 
 app.use(errorMiddleware);
 
